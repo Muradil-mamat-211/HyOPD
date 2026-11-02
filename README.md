@@ -221,10 +221,21 @@ $$
 L_t^{REC} = \sum_{i \in \mathcal{D}_t} p_i \log \frac{p_i}{q_i} + (1 - m_D) \log \frac{1 - m_D}{1 - Q_D}
 $$
 
-其中：
-- **第一项（Deficit-token FKL）**：$\sum_{i \in \mathcal{D}_t} p_i \log \frac{p_i}{q_i}$ ，针对严重欠覆盖的 Teacher modes 进行直接的逐 Token 模式恢复；
-- **第二项（Residual-category FKL）**：$(1 - m_D) \log \frac{1 - m_D}{1 - Q_D}$ ，将 Deficit Set 以外的所有 token 聚合成单一残差类别，显式约束剩余词表保留合理的总概率质量；
-- 质量统计项定义为：
+公式具体由两项构成：
+
+1. **Deficit-token FKL 项**（针对严重欠覆盖的 Teacher modes 进行直接的逐 Token 模式恢复）：
+
+$$
+L_{\text{deficit}} = \sum_{i \in \mathcal{D}_t} p_i \log \frac{p_i}{q_i}
+$$
+
+2. **Residual-category FKL 项**（将 Deficit Set 以外的所有 token 聚合成单一残差类别，显式约束剩余词表保留合理的总概率质量）：
+
+$$
+L_{\text{residual}} = (1 - m_D) \log \frac{1 - m_D}{1 - Q_D}
+$$
+
+其中质量统计项定义为：
 
 $$
 m_D = \sum_{i \in \mathcal{D}_t} p_i, \qquad Q_D = \sum_{i \in \mathcal{D}_t} q_i

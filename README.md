@@ -113,58 +113,7 @@ $$
 
 ## 二、算法设计 (Algorithm Design: Coverage-Adaptive Recovery–Refinement OPD)
 
-### 算法核心架构流程图
-
-```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "background": "#FFFFFF",
-    "primaryColor": "#F0F7FF",
-    "primaryTextColor": "#0F172A",
-    "primaryBorderColor": "#3B82F6",
-    "lineColor": "#64748B",
-    "edgeLabelBackground": "#FFFFFF",
-    "tertiaryColor": "#FEFCE8"
-  }
-}}%%
-flowchart TD
-    classDef input fill:#EFF6FF,stroke:#3B82F6,stroke-width:1.5px,color:#1E3A8A,rx:6,ry:6
-    classDef step fill:#F8FAFC,stroke:#CBD5E1,stroke-width:1.5px,color:#0F172A,rx:6,ry:6
-    classDef diagnosis fill:#FFFBEB,stroke:#F59E0B,stroke-width:1.5px,color:#92400E,rx:6,ry:6
-    classDef branch fill:#F0FDF4,stroke:#10B981,stroke-width:1.5px,color:#065F46,rx:6,ry:6
-    classDef rkl fill:#F1F5F9,stroke:#64748B,stroke-width:1.5px,color:#334155,rx:6,ry:6
-    classDef output fill:#FAF5FF,stroke:#8B5CF6,stroke-width:2px,color:#581C87,rx:6,ry:6
-
-    State["<b>Student Rollout Prefix</b><br/>s_t = (x, y_&lt;t)"]:::input
-    Dist["<b>Full Vocab Distribution Computation</b><br/>Teacher: p = π_T(·|s_t) &nbsp;|&nbsp; Student: q = π_θ(·|s_t)"]:::step
-
-    State --> Dist
-
-    TopP["<b>Step 1: Extract Teacher Nucleus</b><br/>N_t^ρ = TopP(p, ρ)"]:::step
-    Dist --> TopP
-
-    Deficit["<b>Step 2: Detect Deficit Alternatives</b><br/>r_i = q_i / p_i &lt; τ  &nbsp;➔&nbsp; Deficit Set D_t"]:::diagnosis
-    TopP --> Deficit
-
-    Coverage["<b>Step 3: Coverage Routing Metric</b><br/>C_t = Student Support Ratio over Nucleus"]:::diagnosis
-    Deficit --> Coverage
-
-    Weights["<b>Step 5: Coverage-Adaptive Weights</b><br/>Recovery: α_F(C_t) &nbsp;|&nbsp; Refinement: α_R(C_t)"]:::diagnosis
-    Coverage --> Weights
-
-    LossRec["<b>Step 4: Residual-aware FKL Loss</b><br/>L_t^REC = Deficit FKL + Residual Category"]:::branch
-    Deficit --> LossRec
-
-    LossRKL["<b>Full Vocabulary Reverse KL</b><br/>L_t^RKL = D_KL(q || p)"]:::rkl
-    Dist --> LossRKL
-
-    JointLoss["<b>Step 6: Joint Objective</b><br/>L_t = α_R(C_t) L_t^RKL + α_F(C_t) L_t^REC"]:::output
-
-    Weights --> JointLoss
-    LossRec --> JointLoss
-    LossRKL --> JointLoss
-```
+### 算法核心架构
 
 $$
 \text{Teacher Top-}p \;\longrightarrow\; \text{Student Coverage} \;\longrightarrow\; \text{Deficit Set} \;\longrightarrow\; \text{Residual-aware FKL} \;\longrightarrow\; \text{Adaptive RKL/FKL}

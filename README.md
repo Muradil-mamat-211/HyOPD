@@ -1,7 +1,14 @@
+<div align="center">
+
+<img src="assets/hyopd-mark.svg" alt="HyOPD monogram" width="130">
+
 # HyOPD: Hybrid On-Policy Distillation
 
-> **Hybrid On-Policy Distillation via Coverage-Adaptive Recovery–Refinement**  
-> 核心思想：先利用 FKL 恢复严重欠覆盖的 Teacher-supported modes，再利用 RKL 在已有 support 上进行 Mode-seeking Refinement。
+**⚡ Hybrid On-Policy Distillation via Coverage-Adaptive Recovery–Refinement**
+
+*核心思想：先利用 FKL 恢复严重欠覆盖的 Teacher-supported modes，再利用 RKL 在已有 support 上进行 Mode-seeking Refinement。*
+
+</div>
 
 ---
 

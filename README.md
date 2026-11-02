@@ -57,12 +57,12 @@ $$
 当 Teacher 认为某个 token 非常重要 ($p_i \gg 0$) ，而 Student 几乎未分配概率质量 ($q_i \to 0$) 时：
 
 $$
-q_i \log \frac{q_i}{p_i} \to 0
+q_i \log \frac{q_i}{p_i} \longrightarrow 0 \quad (q_i \to 0)
 $$
 
 也就是说，Student 欠覆盖的 token 对 RKL 的直接贡献极小。
 
-从 Logit Gradient 角度分析，设 Student logits 为 $z = [z_1, \dots, z_V]$ 且 $q_i = \operatorname{Softmax}(z)_i$ ，RKL 对 Student logit 的梯度为：
+从 Logit Gradient 角度分析，设 Student logits 为 $z = [z_1, \dots, z_V]$ 且 $q_i = \text{Softmax}(z)_i$ ，RKL 对 Student logit 的梯度为：
 
 $$
 \frac{\partial L^{RKL}}{\partial z_i} = q_i \left( \log \frac{q_i}{p_i} - D_{\mathrm{KL}}(q \parallel p) \right)
@@ -71,7 +71,7 @@ $$
 当 $q_i \to 0$ 时：
 
 $$
-\frac{\partial L^{RKL}}{\partial z_i} \to 0
+\frac{\partial L^{RKL}}{\partial z_i} \longrightarrow 0 \quad (q_i \to 0)
 $$
 
 这就是 **RKL Gradient Starvation（梯度饥饿）**：
@@ -89,17 +89,17 @@ $$
 
 与 RKL 的核心区别在于：**Forward KL 由 Teacher 分布 $p$ 加权**，具备经典的 **Zero-avoiding / Mode-covering** 特性。
 
-当 $q_i \to 0, p_i \gt 0$ 时：
+当 $q_i \to 0, \, p_i \gt 0$ 时：
 
 $$
-p_i \log \frac{p_i}{q_i} \to +\infty
+p_i \log \frac{p_i}{q_i} \longrightarrow +\infty
 $$
 
 #### 梯度对比与恢复机制
 FKL 对 Student Logit 的梯度为：
 
 $$
-\frac{\partial L^{FKL}}{\partial z_i} = q_i - p_i \xrightarrow{q_i \to 0} -p_i
+\frac{\partial L^{FKL}}{\partial z_i} = q_i - p_i \longrightarrow -p_i \quad (q_i \to 0)
 $$
 
 只要 Teacher 的概率 $p_i \gt 0$ ，梯度下降就会直接增大对应的 Student logit，提供不会随 Student 概率衰减的明确恢复信号。
@@ -113,18 +113,61 @@ $$
 
 ## 二、算法设计 (Algorithm Design: Coverage-Adaptive Recovery–Refinement OPD)
 
-### 算法核心架构
+### 算法核心架构流程图
 
 ```mermaid
-flowchart LR
-    A["Teacher Top-p Nucleus"] --> B["Student Support Check"]
-    B --> C["Deficit Set Identification"]
-    C --> D["Coverage Metric Routing"]
-    D --> E["Residual-aware FKL + Adaptive RKL"]
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#FFFFFF",
+    "primaryColor": "#F0F7FF",
+    "primaryTextColor": "#0F172A",
+    "primaryBorderColor": "#3B82F6",
+    "lineColor": "#64748B",
+    "edgeLabelBackground": "#FFFFFF",
+    "tertiaryColor": "#FEFCE8"
+  }
+}}%%
+flowchart TD
+    classDef input fill:#EFF6FF,stroke:#3B82F6,stroke-width:1.5px,color:#1E3A8A,rx:6,ry:6
+    classDef step fill:#F8FAFC,stroke:#CBD5E1,stroke-width:1.5px,color:#0F172A,rx:6,ry:6
+    classDef diagnosis fill:#FFFBEB,stroke:#F59E0B,stroke-width:1.5px,color:#92400E,rx:6,ry:6
+    classDef branch fill:#F0FDF4,stroke:#10B981,stroke-width:1.5px,color:#065F46,rx:6,ry:6
+    classDef rkl fill:#F1F5F9,stroke:#64748B,stroke-width:1.5px,color:#334155,rx:6,ry:6
+    classDef output fill:#FAF5FF,stroke:#8B5CF6,stroke-width:2px,color:#581C87,rx:6,ry:6
+
+    State["<b>Student Rollout Prefix</b><br/>s_t = (x, y_&lt;t)"]:::input
+    Dist["<b>Full Vocab Distribution Computation</b><br/>Teacher: p = π_T(·|s_t) &nbsp;|&nbsp; Student: q = π_θ(·|s_t)"]:::step
+
+    State --> Dist
+
+    TopP["<b>Step 1: Extract Teacher Nucleus</b><br/>N_t^ρ = TopP(p, ρ)"]:::step
+    Dist --> TopP
+
+    Deficit["<b>Step 2: Detect Deficit Alternatives</b><br/>r_i = q_i / p_i &lt; τ  &nbsp;➔&nbsp; Deficit Set D_t"]:::diagnosis
+    TopP --> Deficit
+
+    Coverage["<b>Step 3: Coverage Routing Metric</b><br/>C_t = Student Support Ratio over Nucleus"]:::diagnosis
+    Deficit --> Coverage
+
+    Weights["<b>Step 5: Coverage-Adaptive Weights</b><br/>Recovery: α_F(C_t) &nbsp;|&nbsp; Refinement: α_R(C_t)"]:::diagnosis
+    Coverage --> Weights
+
+    LossRec["<b>Step 4: Residual-aware FKL Loss</b><br/>L_t^REC = Deficit FKL + Residual Category"]:::branch
+    Deficit --> LossRec
+
+    LossRKL["<b>Full Vocabulary Reverse KL</b><br/>L_t^RKL = D_KL(q || p)"]:::rkl
+    Dist --> LossRKL
+
+    JointLoss["<b>Step 6: Joint Objective</b><br/>L_t = α_R(C_t) L_t^RKL + α_F(C_t) L_t^REC"]:::output
+
+    Weights --> JointLoss
+    LossRec --> JointLoss
+    LossRKL --> JointLoss
 ```
 
 $$
-\boxed{\text{Teacher Top-}p \quad \longrightarrow \quad \text{Student Coverage} \quad \longrightarrow \quad \text{Deficit Set} \quad \longrightarrow \quad \text{Residual-aware FKL} \quad \longrightarrow \quad \text{Adaptive RKL/FKL}}
+\text{Teacher Top-}p \;\longrightarrow\; \text{Student Coverage} \;\longrightarrow\; \text{Deficit Set} \;\longrightarrow\; \text{Residual-aware FKL} \;\longrightarrow\; \text{Adaptive RKL/FKL}
 $$
 
 ---
@@ -135,7 +178,7 @@ $$
 按照 Teacher 概率从高到低排序，选取累计概率质量达到 $\rho$ 的最小集合（推荐设置 $\rho = 0.8$ ）：
 
 $$
-\mathcal{N}_t^\rho = \operatorname{TopP}(p, \rho)
+\mathcal{N}_t^\rho = \text{TopP}(p, \rho)
 $$
 
 > **目的**：首先聚焦 Teacher 最核心的 probability mass，避免无意义的长尾低概率 token 引入优化噪声。
@@ -153,7 +196,7 @@ $$
 设定相对 support 阈值 $\tau$ （如 $\tau = 0.1$ ）。若 $q_i / p_i \lt \tau$ ，则判定为欠覆盖 token（Deficit token），构建 Deficit Set：
 
 $$
-\mathcal{D}_t = \left\lbrace i \in \mathcal{N}_t^\rho : \frac{q_i}{p_i} \lt \tau \right\rbrace
+\mathcal{D}_t = \\{ i \in \mathcal{N}_t^\rho : \frac{q_i}{p_i} \lt \tau \\}
 $$
 
 ---
@@ -163,7 +206,7 @@ $$
 定义 Student 对 Teacher 核心概率质量的覆盖度指标 $C_t$ ：
 
 $$
-C_t = \frac{\sum_{i \in \mathcal{N}_t^\rho} p_i \cdot \mathbf{1}[q_i / p_i \ge \tau]}{\sum_{i \in \mathcal{N}_t^\rho} p_i} = 1 - \frac{\sum_{i \in \mathcal{D}_t} p_i}{\sum_{i \in \mathcal{N}_t^\rho} p_i}
+C_t = \frac{\sum_{i \in \mathcal{N}_t^\rho} p_i \cdot \mathbb{I}[q_i / p_i \ge \tau]}{\sum_{i \in \mathcal{N}_t^\rho} p_i} = 1 - \frac{\sum_{i \in \mathcal{D}_t} p_i}{\sum_{i \in \mathcal{N}_t^\rho} p_i}
 $$
 
 - **物理意义**：表示 Teacher nucleus 中有多少比例的概率质量已获得 Student 的相对支持。 $C_t$ 作为动态调控两路损失的 Router。
@@ -175,10 +218,13 @@ $$
 为避免简单 Deficit-only FKL 导致整体质量分配畸变（推动欠覆盖集合总概率 $Q_D \to 1$ ），算法将 Deficit Set 以外的所有 token 合并为一个**残差类别（Residual Category）**：
 
 $$
-L_t^{REC} = \underbrace{\sum_{i \in \mathcal{D}_t} p_i \log \frac{p_i}{q_i}}_{\text{Deficit-token FKL}} + \underbrace{(1 - m_D) \log \frac{1 - m_D}{1 - Q_D}}_{\text{Residual-category FKL}}
+L_t^{REC} = \sum_{i \in \mathcal{D}_t} p_i \log \frac{p_i}{q_i} + (1 - m_D) \log \frac{1 - m_D}{1 - Q_D}
 $$
 
 其中：
+- **第一项（Deficit-token FKL）**：$\sum_{i \in \mathcal{D}_t} p_i \log \frac{p_i}{q_i}$ ，针对严重欠覆盖的 Teacher modes 进行直接的逐 Token 模式恢复；
+- **第二项（Residual-category FKL）**：$(1 - m_D) \log \frac{1 - m_D}{1 - Q_D}$ ，将 Deficit Set 以外的所有 token 聚合成单一残差类别，显式约束剩余词表保留合理的总概率质量；
+- 质量统计项定义为：
 
 $$
 m_D = \sum_{i \in \mathcal{D}_t} p_i, \qquad Q_D = \sum_{i \in \mathcal{D}_t} q_i
@@ -203,7 +249,7 @@ $$
 设定覆盖度阈值 $\delta_C = 0.8$ ，最大恢复权重 $\alpha_{\max} = 0.8$ 。动态计算恢复权重 $\alpha_F(C_t)$ 与优化权重 $\alpha_R(C_t)$ ：
 
 $$
-\alpha_F(C_t) = \alpha_{\max} \operatorname{clip}\left( \frac{\delta_C - C_t}{\delta_C}, 0, 1 \right)
+\alpha_F(C_t) = \alpha_{\max} \cdot \text{clip}\left( \frac{\delta_C - C_t}{\delta_C}, 0, 1 \right)
 $$
 
 $$

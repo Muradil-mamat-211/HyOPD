@@ -4,9 +4,45 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.trainer.distillation.coverage_adaptive_loss import TokenMetric, coverage_adaptive_full_vocab, coverage_metrics
+from verl.trainer.distillation.coverage_adaptive_loss import (
+    TokenMetric,
+    _coverage_routing,
+    coverage_adaptive_full_vocab,
+    coverage_metrics,
+)
+from verl.workers.config import FullVocabularyOPDConfig
 
-SETTINGS = SimpleNamespace(top_p=0.8, coverage_ratio_threshold=0.2, coverage_threshold=0.8, residual_eps=1e-8)
+SETTINGS = SimpleNamespace(
+    top_p=0.8, coverage_ratio_threshold=0.2, coverage_threshold=0.8, alpha_max=0.8, residual_eps=1e-8
+)
+
+
+def test_default_alpha_schedule_and_inclusive_full_rkl_route():
+    coverage = torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0], requires_grad=True)
+    alpha_r, alpha_f, route = _coverage_routing(coverage, SETTINGS)
+    torch.testing.assert_close(alpha_r, torch.tensor([0.2, 0.4, 0.6, 0.8, 1.0, 1.0]), rtol=0, atol=1e-7)
+    torch.testing.assert_close(alpha_f, torch.tensor([0.8, 0.6, 0.4, 0.2, 0.0, 0.0]), rtol=0, atol=1e-7)
+    assert route.tolist() == [False, False, False, False, True, True]
+    assert not alpha_r.requires_grad and not alpha_f.requires_grad
+
+
+@pytest.mark.parametrize("alpha_max", [0.0, 0.35, 1.0])
+def test_alpha_schedule_uses_configured_maximum(alpha_max):
+    cfg = FullVocabularyOPDConfig(alpha_max=alpha_max)
+    alpha_r, alpha_f, _ = _coverage_routing(torch.tensor([0.0, 0.4, 0.8]), cfg)
+    torch.testing.assert_close(alpha_f, torch.tensor([alpha_max, alpha_max / 2, 0.0]))
+    torch.testing.assert_close(alpha_r, 1 - alpha_f)
+
+
+def test_full_rkl_metrics_include_exact_coverage_threshold():
+    p, q = torch.tensor([[0.8, 0.2]]), torch.tensor([[0.99, 0.01]])
+    _, details = coverage_adaptive_full_vocab(p.log(), q.log(), FullVocabularyOPDConfig(top_p=1.0))
+    assert details["coverage"].item() == torch.tensor(0.8).item()
+    assert details["full_rkl_route"].item()
+    assert details["alpha_r"].item() == 1.0 and details["alpha_f"].item() == 0.0
+    metrics = coverage_metrics(details)
+    assert metrics["coverage/full_rkl_ratio"].aggregate() == 1.0
+    assert metrics["coverage/hybrid_ratio"].aggregate() == 0.0
 
 
 def reference(p, logits, cfg):
@@ -22,7 +58,8 @@ def reference(p, logits, cfg):
                 break
         deficit = [i for i in keep if float((qq[i] / pp[i]).detach()) < cfg.coverage_ratio_threshold]
         c = sum(float(pp[i]) for i in keep if i not in deficit) / sum(float(pp[i]) for i in keep)
-        a = min(c / cfg.coverage_threshold, 1.0)
+        alpha_f = cfg.alpha_max * max(0.0, min((cfg.coverage_threshold - c) / cfg.coverage_threshold, 1.0))
+        alpha_r = 1 - alpha_f
         rr = (qq * (qq.log() - pp.log())).sum()
         if deficit:
             pm, qm = pp[deficit].sum(), qq[deficit].sum()
@@ -30,7 +67,7 @@ def reference(p, logits, cfg):
             ff += (1 - pm) * ((1 - pm).clamp_min(cfg.residual_eps).log() - (1 - qm).clamp_min(cfg.residual_eps).log())
         else:
             ff = qq.sum() * 0
-        totals.append(a * rr + (1 - a) * ff)
+        totals.append(alpha_r * rr + alpha_f * ff)
         rkl.append(rr)
         rec.append(ff)
         cov.append(c)
@@ -51,18 +88,23 @@ def reference(p, logits, cfg):
 )
 def test_router_rkl_recovery_and_gradient(q):
     p = torch.tensor([[0.50, 0.29, 0.11, 0.10]])
+    teacher = p.log().requires_grad_()
     logits = torch.tensor([q]).log().requires_grad_()
-    actual, d = coverage_adaptive_full_vocab(p.log(), logits.log_softmax(-1), SETTINGS)
+    actual, d = coverage_adaptive_full_vocab(teacher, logits.log_softmax(-1), SETTINGS)
     expected, rkl, rec, c, deficit = reference(p, logits, SETTINGS)
     torch.testing.assert_close(actual.double(), expected, atol=2e-6, rtol=2e-5)
     torch.testing.assert_close(d["full_rkl"].double(), rkl, atol=2e-6, rtol=2e-5)
     torch.testing.assert_close(d["recovery"].double(), rec, atol=2e-6, rtol=2e-5)
     assert d["coverage"].item() == pytest.approx(c[0], abs=1e-6)
     assert d["deficit_mask"][0].nonzero().flatten().tolist() == deficit[0]
-    assert d["alpha_r"].item() == pytest.approx(min(c[0] / 0.8, 1.0), abs=1e-6)
+    expected_f = SETTINGS.alpha_max * max(0.0, (SETTINGS.coverage_threshold - c[0]) / SETTINGS.coverage_threshold)
+    assert d["alpha_r"].item() == pytest.approx(1 - expected_f, abs=1e-6)
+    assert d["alpha_f"].item() == pytest.approx(expected_f, abs=1e-6)
+    assert torch.equal(d["full_rkl_route"], d["coverage"] >= SETTINGS.coverage_threshold)
     for key in ("coverage", "alpha_r", "alpha_f", "deficit_mask"):
         assert not d[key].requires_grad
-    g = torch.autograd.grad(actual.sum(), logits, retain_graph=True)[0]
+    g, teacher_grad = torch.autograd.grad(actual.sum(), (logits, teacher), retain_graph=True, allow_unused=True)
+    assert teacher_grad is None and torch.isfinite(g).all()
     gr = torch.autograd.grad(expected.sum(), logits)[0]
     torch.testing.assert_close(g, gr, atol=2e-6, rtol=2e-5)
 
@@ -102,7 +144,7 @@ def test_token_metrics_merge_uneven_ranks_and_microbatches():
 
 def test_residual_near_one_and_zero_action_rank():
     settings = SimpleNamespace(
-        top_p=0.99999999, coverage_ratio_threshold=2.0, coverage_threshold=0.8, residual_eps=1e-8
+        top_p=0.99999999, coverage_ratio_threshold=2.0, coverage_threshold=0.8, alpha_max=0.8, residual_eps=1e-8
     )
     logits = torch.tensor([[0.0, -80.0, -90.0]], requires_grad=True)
     log_p = torch.tensor([[0.0, -70.0, -100.0]]).log_softmax(-1)

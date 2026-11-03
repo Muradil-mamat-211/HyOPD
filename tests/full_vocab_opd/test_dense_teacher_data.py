@@ -46,8 +46,8 @@ def test_dense_teacher_causal_alignment_masks_first_last_and_eos():
 def test_native_dynamic_microbatches_slice_dense_cpu_teacher_before_late_h2d(monkeypatch):
     lengths = [8, 4, 6, 5]
     rows = [torch.full((8, 7), float(i)) for i in range(4)]
-    mask = nested([torch.tensor([1]) for _ in lengths])
-    teacher = torch.stack(rows)
+    mask = nested([torch.tensor(row) for row in ([1, 0, 1], [1, 1, 1], [0, 1, 1], [1, 1, 0])])
+    teacher = torch.stack(rows).half()
     data = TensorDict(
         {
             "input_ids": nested([torch.arange(n) for n in lengths]),
@@ -62,12 +62,17 @@ def test_native_dynamic_microbatches_slice_dense_cpu_teacher_before_late_h2d(mon
     microbatches, indexes = prepare_micro_batches(data, same_micro_num_in_dp=False)
     assert len(microbatches) > 1
     transfers = []
+    expected_actions = []
     original_to = torch.Tensor.to
 
     def tracked_to(self, *args, **kwargs):
-        if self.ndim == 3 and self.shape[-2:] == (8, 7):
+        if self.ndim >= 2 and self.shape[-1] == 7:
+            # Teacher must already be selected on CPU; a dense microbatch transfer fails.
+            assert self.ndim == 2 and self.device.type == "cpu"
+            assert self.shape[0] == len(expected_actions)
+            assert self[:, 0].tolist() == expected_actions
+            assert kwargs["dtype"] == torch.float32
             transfers.append(tuple(self.shape))
-            assert self.shape[0] < 4
         return original_to(self, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", tracked_to)
@@ -79,10 +84,14 @@ def test_native_dynamic_microbatches_slice_dense_cpu_teacher_before_late_h2d(mon
         ids = moved["sample_id"].tolist()
         for row, identity in zip(moved["teacher_logprobs"], ids, strict=True):
             assert row[0, 0] == identity
-        student_actions = torch.zeros(len(ids), 7, requires_grad=True)  # current forward completed
+        expected_actions[:] = [identity for identity in ids for _ in range(int(mask.unbind()[identity].sum()))]
+        assert len(expected_actions) > len(ids)  # distinguish action count from microbatch size
+        student_actions = torch.zeros(len(expected_actions), 7, requires_grad=True)  # current forward completed
         received = teacher_action_logprobs(moved, student_actions)
         assert len(transfers) == before + 1
-        assert received[:, 0].tolist() == ids
+        assert transfers[-1] == (len(expected_actions), 7)
+        assert received[:, 0].tolist() == expected_actions
+        assert received.dtype == torch.float32 and not received.requires_grad
         seen.extend(ids)
     assert sorted(seen) == [0, 1, 2, 3]
     assert teacher.device.type == "cpu" and not teacher.requires_grad

@@ -31,8 +31,11 @@ full_vocab_opd:
   # Minimum student/teacher probability ratio for coverage.
   coverage_ratio_threshold: 0.2
 
-  # Coverage above this threshold selects full RKL.
+  # Coverage at or above this threshold selects full RKL.
   coverage_threshold: 0.8
+
+  # Maximum recovery weight; alpha_f = alpha_max * clip((threshold-C)/threshold, 0, 1).
+  alpha_max: 0.8
 
   # Hybrid mixing schedule.
   alpha_schedule: linear

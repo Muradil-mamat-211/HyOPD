@@ -10,6 +10,14 @@ import torch
 from verl.utils.metric import AggregationType, Metric
 
 
+@torch.no_grad()
+def _coverage_routing(coverage, settings):
+    """Return detached RKL/REC weights and the inclusive full-RKL route."""
+    alpha_f = settings.alpha_max * ((settings.coverage_threshold - coverage) / settings.coverage_threshold).clamp(0, 1)
+    alpha_r = 1 - alpha_f
+    return alpha_r, alpha_f, coverage >= settings.coverage_threshold
+
+
 def coverage_adaptive_full_vocab(log_p, log_q, settings):
     """Return one differentiable loss per action and detached routing diagnostics.
 
@@ -37,8 +45,7 @@ def coverage_adaptive_full_vocab(log_p, log_q, settings):
         deficit = nucleus & ~covered
         nucleus_mass = (p * nucleus).sum(-1)
         coverage = (p * (nucleus & covered)).sum(-1) / nucleus_mass
-        alpha_r = (coverage / settings.coverage_threshold).clamp(0, 1)
-        alpha_f = 1 - alpha_r
+        alpha_r, alpha_f, full_rkl_route = _coverage_routing(coverage, settings)
         m_d = (p * deficit).sum(-1)
         # Sum the complement to avoid catastrophic cancellation for m_D ~ 1.
         residual_p = p.masked_fill(deficit, 0).sum(-1)
@@ -55,7 +62,7 @@ def coverage_adaptive_full_vocab(log_p, log_q, settings):
         "coverage": coverage,
         "alpha_r": alpha_r,
         "alpha_f": alpha_f,
-        "full_rkl_route": coverage > settings.coverage_threshold,
+        "full_rkl_route": full_rkl_route,
         "nucleus_size": nucleus.sum(-1),
         "deficit_size": deficit.sum(-1),
         "deficit_teacher_mass": m_d,

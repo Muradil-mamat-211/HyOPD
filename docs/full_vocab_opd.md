@@ -2,7 +2,8 @@
 
 当前实现基于 veRL `3fdf2b548882a8aeccf0842c2150d9c9f1790a55`，使用原生异步
 **vLLM Teacher + FSDP2 Student**。Student Full-Vocab 算子、Coverage、RKL、REC、
-stop-gradient 和 optimizer cadence 延续上一版，数学模块和算子 patch 未改动。
+stop-gradient 和 optimizer cadence 延续上一版。本轮按 README 修正带 `alpha_max` 的
+mixing schedule 与 Full-RKL 边界，并将 Teacher H2D 限定为 CPU 选出的 action rows。
 逐文件变更及测试证据见 [交付报告](full_vocab_opd_delivery_report.md)。
 
 ## 数据流
@@ -20,7 +21,7 @@ flowchart TD
     I --> J[tqbridge 恢复 dense CPU B×T×V]
     J --> K[原生 minibatch 与 dynamic microbatch 同步重排切分]
     K --> L[Student FSDP2 forward 及原有 Liger Full-Vocab 算子]
-    L --> M[仅当前 Teacher microbatch H2D]
+    L --> M[CPU 选择 action rows 后仅 N_action×V H2D]
     M --> N[按 action mask 选取相同 prediction rows]
     N --> O[原有 Coverage / RKL / REC 与 agg_loss]
     O --> P[原生 backward / grad clip / optimizer / scheduler]
@@ -85,12 +86,17 @@ TransferQueue 0.1.11 会将非 scalar 字段重新打包为 nested tensor，即�
 Teacher 字段和 sample 一起参与原生 TensorDict 索引、shuffle、minibatch 及 dynamic
 microbatch reorder。`FSDPEngine.forward_step` 调用
 `move_micro_batch_without_teacher`：只移动 Student 输入，Teacher 当前片段仍在 CPU。
-Student forward 完成后，Full-Vocab loss 调用 `teacher_action_logprobs`，此时才移动
-已经切好的 `[B_mu,T,V]`，转换为 FP32，并选择有效 action prediction rows。
-不存在完整 train batch 的 Teacher `.cuda()`/`.to(cuda)`。
+Student forward 完成后，Full-Vocab loss 调用 `teacher_action_logprobs`：根据当前
+sequence length 和 `response_mask` 在 CPU 选取相同 causal prediction rows，先得到
+`[N_action,V]` CPU tensor，再执行唯一一次 `.to(student_device, dtype=torch.float32)`。
+若 mask/offsets 已在 Student device，仅复制这些小型对齐信息回 CPU。原生 `loss_mask`
+聚合不变。tool observation、padding 和最后 dummy row 不参与蒸馏，zero-action
+synthetic sample 安全返回 `[0,V]`。不搬运完整 Teacher microbatch `[B_mu,T,V]`。
 
 CPU payload 大约为 `B*T*V*sizeof(cache_dtype)`；服务端与传输还会有临时副本。
-Student Full-Vocab 输出大约为 `4*N_mu*V` GPU bytes，loss/sort 另有临时开销。
+Student Full-Vocab 输出大约为 `4*N_mu*V` GPU bytes；Teacher H2D 仅为
+`4*N_action_mu*V` FP32 bytes，loss/sort 另有临时开销。这是 tensor 大小估算，
+不是实测 GPU peak memory。
 本版接受 dense RAM 存储，不引入额外内存预算、memmap、磁盘缓存或请求 batcher。
 `teacher_cache.dtype` 仅控制 CPU payload 精度，支持 float16/bfloat16/float32。
 FP16 非有限值会报错，可改用更宽 dtype。原生 TQ 清理、checkpoint 行为保持原样。
@@ -131,8 +137,20 @@ PPOTrainer._update_actor
 
 `coverage_adaptive_full_vocab` 是独立 registry mode，`compute_topk_loss` 明确拒绝 Full-Vocab。
 Student `full_log_probs` 保留 autograd，在当前 forward/loss 后从公共 engine outputs 移除。
-Teacher 数据完全 detached。现有 exact teacher nucleus、mass-weighted coverage、线性 gating、
-full-vocab RKL、包含 residual bucket 的 REC、FP32 数学和数值稳定规则保持不变：
+Teacher 数据完全 detached。exact teacher nucleus、mass-weighted coverage、full-vocab
+RKL、包含 residual bucket 的 REC、FP32 数学和数值稳定规则保持不变。mixing schedule
+与 README 正式定义一致：
+
+\[
+\alpha_F(C)=\alpha_{max}\operatorname{clip}\left(\frac{\delta_C-C}{\delta_C},0,1\right),
+\qquad\alpha_R(C)=1-\alpha_F(C).
+\]
+
+`coverage_threshold` 对应 `delta_C`，默认 0.8；`alpha_max` 默认 0.8，验证 finite 且
+处于 `[0,1]`。默认 C=0/0.2/0.4/0.6/0.8/1 时，RKL 权重依次为
+0.2/0.4/0.6/0.8/1/1，REC 权重为 0.8/0.6/0.4/0.2/0/0。
+`full_rkl_route` 使用 `C >= coverage_threshold`，两个 route ratio 同步采用该边界。
+最终损失为：
 
 \[
 L_t=\alpha_R(C_t)L_t^{RKL}+\alpha_F(C_t)L_t^{REC}.
@@ -172,7 +190,7 @@ Teacher 没有 FSDP microbatch 参数。
 在符合 veRL Main 依赖的 GPU 环境安装与启动：
 
 ```bash
-cd /root/autodl-tmp/verl-full-vocab-opd
+cd /root/autodl-tmp/HyOPD-full-vocab-publish
 uv sync --extra fsdp --extra vllm
 source .venv/bin/activate
 bash patches/liger/install.sh
@@ -192,6 +210,8 @@ bash examples/on_policy_distillation_trainer/run_full_vocab_adaptive_opd.sh \
 
 回归命令、结果与 GPU 验证边界见 [交付报告](full_vocab_opd_delivery_report.md)。
 
-当前无卡 2GB 环境的最终 CPU 回归：**130 passed, 21 skipped**，监测到的总 cgroup
-内存峰值 **1560.8 MiB**；没有触发 OOM。真实 GPU 与完整 Ray transport 的未验证范围
-见交付报告。不要在当前 2GB 无卡环境执行上面的 GPU 安装或训练命令。
+当前无卡 2GB 环境仅运行指定六个文件的 CPU correctness regression：
+**42 passed、0 failed**，总 cgroup 内存峰值 **1665.8 MiB**，无 OOM。
+未执行真实 CUDA/vLLM Teacher、FSDP2 collective/NCCL、GPU peak memory/throughput
+或 Ray E2E；GPU smoke 保留 opt-in 且本轮未运行。未安装或改变任何依赖。
+不要在当前 2GB 无卡环境执行上面的 GPU 安装或训练命令。

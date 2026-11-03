@@ -18,7 +18,8 @@
 本分支包含基于 veRL `3fdf2b548882a8aeccf0842c2150d9c9f1790a55` 的完整实现：
 原生异步 vLLM Teacher 提供 Full-Vocabulary prompt logprobs，FSDP2 Student 使用
 可微 Full-Vocab 算子执行既有 Coverage / RKL / REC 训练。
-Teacher 分布保存在 CPU，仅当前训练 micro-batch 在 Student forward 后搬入 GPU。
+Teacher 分布保存在 CPU；当前 micro-batch 在 Student forward 后先在 CPU 选择有效
+action prediction rows，仅将 `[N_action,V]` 以 FP32 搬入 GPU。
 
 - [配置、安装与训练指南](docs/full_vocab_opd.md)
 - [逐文件变更及交付报告](docs/full_vocab_opd_delivery_report.md)
@@ -26,9 +27,10 @@ Teacher 分布保存在 CPU，仅当前训练 micro-batch 在 Student forward �
 - [完整 YAML 示例](examples/on_policy_distillation_trainer/full_vocab_adaptive_opd.yaml)
 - [veRL 上游 README](README.verl.md)
 
-CPU 回归 **130 passed、21 skipped**；2GB 无卡环境下总 cgroup 内存峰值 **1560.8 MiB**。
-真实 GPU vLLM/FSDP2 链路及修复后的完整 Ray transport 尚待实测。
-完整测试范围及 opt-in 命令见交付报告。
+本轮精简 CPU correctness 回归 **42 passed、0 failed**，总 cgroup 内存峰值
+**1665.8 MiB**，低于当前 AutoDL 无卡模式的 2GB 限制。没有启动真实 CUDA/vLLM Teacher、
+FSDP2 collective/NCCL 或 Ray 集群；GPU peak memory / throughput 未验证。
+GPU smoke 保留为 opt-in，本轮未运行；完整范围见交付报告。
 
 在已安装匹配 GPU 依赖、应用 Liger patch 并配置指南中的 `OPD_*` 变量后运行：
 
@@ -246,6 +248,10 @@ $$
 $$
 \alpha_R(C_t) = 1 - \alpha_F(C_t)
 $$
+
+配置对应 `coverage_threshold`（默认 0.8）和 `alpha_max`（默认 0.8）；
+`alpha_max` 必须 finite 且在 `[0,1]`。`C >= coverage_threshold` 计为 Full-RKL route，
+`full_rkl_ratio / hybrid_ratio` 使用同一边界。
 
 #### 策略调配表
 

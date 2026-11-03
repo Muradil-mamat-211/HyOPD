@@ -1,15 +1,47 @@
-# Full-Vocab OPD：vLLM Teacher 迁移交付报告
+# Full-Vocab OPD：vLLM Teacher 迁移与 correctness 交付报告
 
-工作目录：`/root/autodl-tmp/verl-full-vocab-opd`。veRL baseline 为
+当前工作目录：`/root/autodl-tmp/HyOPD-full-vocab-publish`，分支
+`full-vocab-vllm-teacher`。原实现目录为 `/root/autodl-tmp/verl-full-vocab-opd`。veRL baseline 为
 `3fdf2b548882a8aeccf0842c2150d9c9f1790a55`，保留既有 Student 实现后完成此次迁移。
 实现与验证阶段未 commit/push；随后按用户要求发布至 `Muradil-mamat-211/HyOPD`
 的 `full-vocab-vllm-teacher` 分支。保留 `verl-latest` 和原 `HyOPD` 工作区的既有改动。
 迁移前文件备份：`/root/autodl-tmp/verl-full-vocab-opd-before-vllm.tar.gz`。
 
+## 本轮 correctness 修复
+
+本轮只调整 formal mixing schedule、route metric 边界和 Teacher transfer 顺序。
+
+| 文件 | 本轮修改 |
+|---|---|
+| `verl/trainer/distillation/coverage_adaptive_loss.py` | 配置化 alpha_max；inclusive Full-RKL route；其余 Coverage/RKL/REC 与 stop-gradient 保留 |
+| `verl/workers/config/distillation.py` | 新增 `alpha_max=0.8` 并验证 finite / `[0,1]` |
+| `verl/trainer/config/distillation/distillation.yaml` | 显式 alpha_max 默认值及边界注释 |
+| `examples/on_policy_distillation_trainer/full_vocab_adaptive_opd.yaml` | 显式 `alpha_max: 0.8` |
+| `verl/trainer/distillation/full_vocab_cache.py` | 当前 microbatch 在 CPU 选 action prediction rows，仅传 `[N_action,V]` FP32 |
+| `tests/full_vocab_opd/test_coverage_loss.py` | 固定六个 Coverage 点、非默认 alpha_max、inclusive ratio、更新独立 reference，验证 Student gradient 与 Teacher detach |
+| `tests/full_vocab_opd/test_dense_teacher_data.py` | spy 验证 Teacher `.to` 输入已为 action-only；action 数与 microbatch size 明确不同；保留重排/mask/EOS/zero-action 用例 |
+| `tests/full_vocab_opd/test_yaml_config.py` | 验证 YAML 默认值和 alpha_max 非有限/越界拒绝 |
+| `README.md`、`docs/full_vocab_opd.md` | 正式公式、action-only 传输和当前 CPU-only 验证边界 |
+| 本报告、`full_vocab_opd_implementation_plan.md`、`full_vocab_opd_validation.txt` | 当前结果、最小命令和未验证项 |
+
+公式为 `alpha_f = alpha_max * clip((coverage_threshold-C)/coverage_threshold, 0, 1)`，
+`alpha_r = 1-alpha_f`。两个默认参数均为 0.8，C=0 保留 0.2 RKL；
+C 恰为 0.8 时 Full-RKL route 为 True，alpha_r/f 为 1/0。
+
+Teacher H2D 已变为 action-only：先在 CPU 按当前 TensorDict sample 顺序和
+`P-1+r` 选出有效 prediction rows，再对 `[N_action,V]` 一次性执行
+`.to(student_device, dtype=torch.float32)`。Teacher 仍 detached，无 teacher_ids。
+
+本轮 **42 passed、0 failed**（指定六个 CPU 文件，12.48s），总 cgroup 内存峰值
+**1665.8 MiB**；无 OOM。Ruff 和 `git diff --check` 通过。没有重装或改变环境。
+本轮未运行 GPU smoke、真实 CUDA/vLLM、FSDP2 collective/NCCL、Ray E2E；
+GPU peak memory / throughput 未验证，相关 opt-in 测试保留。
+CPU correctness 覆盖范围内没有发现剩余 blocker；GPU 执行仍需后续实测。
+
 ## 1–2. 文件清单及具体修改
 
-下表描述相对上一版 Teacher-FSDP2 实现的本次修改。仓库 git diff 同时含上一版
-未提交的 Student 实现；不能将所有 git diff 都理解为本次重写。
+下表保留此前 Teacher-FSDP2 → vLLM 的迁移明细。本轮 correctness patch 以上节为准，
+没有重新设计架构，也没有改动 Student 算子或 optimizer cadence。
 
 | 文件 | 本次变更 |
 |---|---|
@@ -23,7 +55,7 @@
 | `verl/trainer/distillation/full_vocab_cache.py` | 删除旧 budget/jagged cache helpers；改为 CPU dense 恢复、右 padding、microbatch 输入搬运、loss 后置 Teacher H2D 及 action-row 对齐 |
 | `verl/trainer/distillation/full_vocab.py` | 改为 Full vLLM mode 判断及 Student/tokenizer/RAM 验证；删除 Teacher TrainingWorker 配置构建和禁用 AgentLoop hook 的适配器 |
 | `verl/trainer/distillation/losses.py` | 独立 Full registry 读取既有 Student full output 和当前 dense Teacher microbatch；仍调用原算法；明确禁止 full 进入 compute_topk_loss |
-| `verl/workers/engine/fsdp/transformer_impl.py` | 删除 Teacher 专属 CPU offload 分支；Student 当前 forward 前保留 Teacher CPU 字段，forward 后由 loss 搬当前 microbatch；保留 Student full output/autograd 处理 |
+| `verl/workers/engine/fsdp/transformer_impl.py` | 删除 Teacher 专属 CPU offload 分支；Student 当前 forward 前保留 Teacher CPU 字段，forward 后由 loss 在 CPU 选出并传输当前 action rows；保留 Student full output/autograd 处理 |
 | `verl/workers/engine_workers.py` | 删除 Teacher 专属冻结/optimizer 检查、inference 包装和 runtime vocab metadata 方法；保留原 Student TokenMetric 聚合 |
 | `verl/trainer/ppo/v1/trainer_base.py` | 删除 Teacher TrainingWorker 注册/初始化、driver batch scoring、预算/释放调度及 Teacher DP padding；恢复 MultiTeacherModelManager；Student update flags 保留 |
 | `verl/trainer/main_ppo.py` | 恢复原生 Teacher client 注入 AgentLoop；Full mode 校验 V1 |
@@ -41,9 +73,9 @@
 | `patches/liger/README.md` | 安装说明明确 patch 仅供 Student 使用；算子 patch 内容未改 |
 | `docs/full_vocab_opd.md`、本报告、`full_vocab_opd_implementation_plan.md`、`full_vocab_opd_validation.txt` | 当前数据流、迁移审计、运行命令及实测边界 |
 
-`coverage_adaptive_loss.py`、`torch_functional.py`、四文件 Liger patch，以及
-`dense_common.py/qwen2_vl.py/qwen3_vl.py/qwen3_5.py/glm4v.py` 的 SHA256 均与本次
-修改前快照一致。Student 算子与数学目标未重写。
+此前 Teacher backend 迁移阶段，上述 Student 数学/算子文件保持哈希一致。
+本轮仅在 `coverage_adaptive_loss.py` 修正 README 的 mixing schedule 和 inclusive route；
+`torch_functional.py`、Liger patch、模型输出补丁和 GPU smoke 文件仍未改动。
 
 ## 3. 删除的上一版 Teacher-FSDP2 路线
 
@@ -107,9 +139,9 @@ TQ 0.1.11 实测会将等长字段读成 nested；增加读取边界的 dense �
 TensorDict 中的 Teacher 和 sample fields 同时通过原生 reorder/minibatch/dynamic
 microbatch slicing。`move_micro_batch_without_teacher` 在 Student forward 前仅移动
 其余输入，Teacher microbatch 仍为 CPU dense。当前 Student forward 完成后才调用
-`teacher_action_logprobs`，将已经切好的 `[B_mu,T,V]` 搬到 Student device。
-随后按相同 prediction rows 和 action mask 取 `[N_action_mu,V]`，与 Student shape
-逐项检查。没有 batch 外部索引表，没有完整 Teacher train batch 的提前 H2D。
+`teacher_action_logprobs`，先在 CPU 对已经切好的 `[B_mu,T,V]` 按相同 prediction rows
+和 action mask 取 `[N_action_mu,V]`，与 Student shape 逐项检查，再一次传到 Student
+device 并指定 FP32。没有 batch 外部索引表，也不传输整个 Teacher microbatch。
 
 ## 7. Full Student loss 的真实调用链
 
@@ -129,7 +161,7 @@ _update_actor -> ActorRolloutRefWorker.update_actor
 
 Full registry 独立于 Top-K，不读取 teacher_ids。Teacher、Coverage/router 和 alpha
 保持 stop-gradient；Student RKL/REC 概率保留梯度。Coefficient、温度、epsilon、
-exact nucleus、residual bucket、FP32 和原有高/中/低 Coverage 行为保持原实现。
+exact nucleus、residual bucket、FP32 保留，mixing schedule 按上节正式公式修正。
 
 ## 8. Causal alignment 验证
 
@@ -144,46 +176,35 @@ EOS、mask0 observation 和 sample_id 检查 token、vocab、sample、padding �
 
 ## 9. 测试结果与资源边界
 
-本次迁移第一轮完整 CPU 回归已得到 **124 passed, 21 skipped**；随后发现并修复了
-真实 TQ 的 nested repacking，修复相关测试 **7 passed**。最终约束内复测记录见
-[原始验证记录](full_vocab_opd_validation.txt)。
+当前 patch 的结果为 **42 passed、0 failed，6 warnings，12.48s**。
+只运行下面六个 CPU-safe 文件；未运行全仓库 pytest、CUDA kernel 或真实 Ray transport。
+本轮低内存监测的 cgroup 峰值 1665.8 MiB，停止阈值 1850 MiB，host hard limit
+2147483648 bytes；未触发停止或 OOM。原始输出见 [验证记录](full_vocab_opd_validation.txt)。
 
-五类最小用例覆盖：短单 trajectory full decode；多 trajectory 原生 Manager/client
-并发乱序；带 observation 的 action mask；多个 native dynamic microbatch 的样本与
-Teacher 同步重排及后置传输；小 Llama 现有 Student operator/loss/backward/grad clip/
-optimizer 更新，检查 Student 非零梯度和参数变化、Teacher 无 graph/梯度。
+覆盖默认六个 Coverage 点及自定义 alpha_max、边界 route ratio、完整 nucleus/deficit/
+RKL/residual REC/加权 loss、Student finite gradient、Teacher detach、empty deficit 和
+extreme probabilities。数据用例覆盖首末 response/EOS、variable length、tool mask、
+padding、zero action、dynamic reorder 以及 action-only transfer。
 
-最终串行 CPU 回归为 **130 passed, 21 skipped, 6 warnings in 20.01s**。
-21 个 skip 为 20 个 CUDA 用例和 1 个 opt-in Ray 用例。测试采用内存监测保护，
-含系统现有进程的 total cgroup 内存峰值 **1560.8 MiB**，停止阈值 1850 MiB，
-host hard limit 为 2147483648 bytes，未触发停止或 OOM。Ruff、AST/shell 语法、
-`git diff --check`、Liger patch reverse-check 及 Student 文件 SHA256 一致性均通过。
+小 Llama 用例在 CPU 运行现有 Student operator/engine preparation/loss/backward/
+grad clip/SGD update；没有运行 FSDP2 distributed 初始化或 collective。Manager/client
+用例的 RPC endpoint 为进程内替身，没有运行真实 vLLM engine/scheduler。
+TQ 用例只调用已安装包的 packer 和生产 read conversion，替换远程 I/O，不启动 Ray。
 
-新增的 B=1/B=3 低内存用例直接调用已安装 TransferQueue 0.1.11 的
-`AsyncSimpleStorageManager._pack_field_values`，再执行生产 `_async_meta_to_realdata`；
-只替换远程读取端，验证实际 nested 打包恢复为 dense CPU。该检查不启动 Ray，
-因此不替代跨进程 transport 测试。
+CUDA/vLLM Teacher、GPU FSDP2 collective、NCCL、多 GPU Ray E2E、GPU peak memory
+及 throughput 明确未验证。`test_v1_gpu_smoke.py` 原样保留为 opt-in，本轮不执行。
+CPU 覆盖范围内没有发现剩余 correctness blocker。
 
-CPU 协议测试使用实际 Manager 和 LLMServerClient.generate，RPC endpoint 是进程内
-替身，**没有执行真实 vLLM GPU scheduler**。CPU engine 用例使用真实小模型和现有
-算子/engine preparation/loss，但不声称运行了 GPU FSDP collectives。
-
-当前 AutoDL 无卡模式，用户要求测试总内存不超过 2GB。真实 Ray/TQ 集成之前完成了
-一次执行，发现 nested packing；修复后的真实 Ray 复测未取得成功完成记录，后续在
-该限制下保留为 opt-in。没有把上一版旧缓存的 Ray 通过记录当作本版结果。
-CUDA kernel、real vLLM Teacher/FSDP2 V1 单步、GPU H2D 与 OOM/吞吐实测均未执行。
-对应 opt-in 测试已更新，待 GPU 环境运行。
-
-CPU uv 环境：Python 3.12.3、torch 2.13.0+cpu、patched Liger 0.8.4、transformers 4.57.1、
-tensordict 0.10.0、TransferQueue 0.1.11、Ray 2.59。GPU production pin 包含 transformers
-5.16.1/vLLM 0.32.0；本机未验证该 GPU 依赖组合。
+此前 130 passed / 21 skipped 是迁移阶段的历史结果，不作为本轮更新代码的全套验收声明。
+本轮复用现有 uv CPU 环境（torch 2.13.0+cpu、patched Liger 0.8.4、transformers 4.57.1），
+未安装大型依赖或改变环境。GPU 依赖组合的通过状态不作声明。
 
 ## 10. 运行命令
 
 模型、数据和资源变量详见 [运行指南](full_vocab_opd.md)。在准备好的 GPU 环境内：
 
 ```bash
-cd /root/autodl-tmp/verl-full-vocab-opd
+cd /root/autodl-tmp/HyOPD-full-vocab-publish
 uv sync --extra fsdp --extra vllm
 source .venv/bin/activate
 bash patches/liger/install.sh
@@ -191,22 +212,20 @@ bash patches/liger/install.sh
 bash examples/on_policy_distillation_trainer/run_full_vocab_adaptive_opd.sh
 ```
 
-CPU 回归（本次实际使用的测试清单；2GB 机器应在内存监测下串行执行）：
+本轮实际 CPU 测试清单（使用已有 CPU 环境，并由内存监测器串行运行）：
 
 ```bash
-OMP_NUM_THREADS=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
-  -p pytest_asyncio.plugin \
-  tests/full_vocab_opd \
-  tests/utils/test_experimental_torch_functional_on_cpu.py \
-  tests/utils/test_transferqueue_utils_on_cpu.py \
-  tests/workers/test_distillation_topk_symmetry_on_cpu.py \
-  tests/workers/test_engine_forward_step_detach_on_cpu.py \
-  tests/trainer/ppo/v1/test_trainer_base_on_cpu.py \
-  tests/trainer/ppo/v1/test_checkpoint_callback_on_cpu.py \
-  tests/trainer/ppo/v1/test_rollout_profiling_on_cpu.py \
-  tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py \
-  tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+OMP_NUM_THREADS=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
+  tests/full_vocab_opd/test_coverage_loss.py \
+  tests/full_vocab_opd/test_dense_teacher_data.py \
+  tests/full_vocab_opd/test_engine_chain.py \
+  tests/full_vocab_opd/test_vllm_teacher.py \
+  tests/full_vocab_opd/test_agent_teacher_flow.py \
+  tests/full_vocab_opd/test_yaml_config.py
 ```
+
+实际运行还断言了 `verl.__file__` 来自当前发布工作区，避免误测旧 editable source；
+内存监测命令及日志见 validation 文件。静态检查仅覆盖本轮修改的 Python 文件。
 
 以下是需要额外资源的 opt-in 命令，本次 2GB 无卡环境不宣称其通过：
 

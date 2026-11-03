@@ -243,6 +243,7 @@ class FullVocabularyOPDConfig(BaseConfig):
     top_p: float = 0.8
     coverage_ratio_threshold: float = 0.2
     coverage_threshold: float = 0.8
+    alpha_max: float = 0.8
     alpha_schedule: str = "linear"
     loss_compute_dtype: str = "float32"
     residual_eps: float = 1e-8
@@ -257,6 +258,8 @@ class FullVocabularyOPDConfig(BaseConfig):
             raise ValueError("top_p and coverage_threshold must be in (0, 1]")
         if not math.isfinite(self.coverage_ratio_threshold) or self.coverage_ratio_threshold <= 0:
             raise ValueError("coverage_ratio_threshold must be finite and positive")
+        if not math.isfinite(self.alpha_max) or not 0 <= self.alpha_max <= 1:
+            raise ValueError("alpha_max must be finite and in [0, 1]")
         if not 0 < self.residual_eps < 1:
             raise ValueError("residual_eps must be in (0, 1)")
         if self.alpha_schedule != "linear" or self.loss_compute_dtype != "float32":

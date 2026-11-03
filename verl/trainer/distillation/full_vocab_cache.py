@@ -1,6 +1,6 @@
 # Copyright 2026 OpenAI
 # Licensed under the Apache License, Version 2.0 (the "License").
-"""Dense CPU teacher trajectories, native microbatch slicing and late microbatch H2D."""
+"""Dense CPU teacher trajectories, native microbatch slicing and action-only H2D."""
 
 import torch
 from torch.nn import functional as F
@@ -45,7 +45,7 @@ def move_micro_batch_without_teacher(micro_batch, device):
 
 
 def teacher_action_logprobs(data, student_actions):
-    """Transfer only this already sliced microbatch, then select identical prediction rows.
+    """Select identical prediction rows on CPU, then transfer only action distributions.
 
     Server extraction has already mapped prompt score[j+1] to prediction row[j].
     Student response_from_nested performs the same single causal selection.
@@ -55,18 +55,19 @@ def teacher_action_logprobs(data, student_actions):
         raise ValueError("Expected detached dense CPU teacher_logprobs [B_micro,T,V] before loss H2D")
     if teacher_cpu.shape[0] != len(data) or teacher_cpu.shape[-1] != student_actions.shape[-1]:
         raise ValueError("Teacher/student microbatch or full vocabulary dimensions differ")
-    teacher = teacher_cpu.to(device=student_actions.device, non_blocking=True).float()
-    response_mask = data["response_mask"]
-    sequence_lengths = data["input_ids"].offsets().diff()
+    # Model inputs/masks may already be on the Student device after its forward.
+    # Copy only the small alignment metadata back; never transfer dense Teacher rows.
+    response_mask = data["response_mask"].detach().cpu()
+    sequence_lengths = data["input_ids"].offsets().detach().cpu().diff()
     response_lengths = response_mask.offsets().diff()
     rows = []
     for i, mask in enumerate(response_mask.unbind()):
         action_positions = mask.bool().nonzero().flatten()
         prediction_rows = sequence_lengths[i] - response_lengths[i] - 1 + action_positions
-        if prediction_rows.numel() and (prediction_rows.min() < 0 or prediction_rows.max() >= teacher.shape[1] - 1):
+        if prediction_rows.numel() and (prediction_rows.min() < 0 or prediction_rows.max() >= teacher_cpu.shape[1] - 1):
             raise ValueError("Teacher action prediction rows are out of range or lack a scored next token")
-        rows.append(teacher[i].index_select(0, prediction_rows.to(teacher.device)))
-    selected = torch.cat(rows, dim=0)
+        rows.append(teacher_cpu[i].index_select(0, prediction_rows))
+    selected = torch.cat(rows, dim=0) if rows else teacher_cpu.new_empty((0, teacher_cpu.shape[-1]))
     if selected.shape != student_actions.shape:
         raise ValueError(f"Teacher/student action distributions differ: {selected.shape} vs {student_actions.shape}")
-    return selected
+    return selected.to(device=student_actions.device, dtype=torch.float32, non_blocking=True)

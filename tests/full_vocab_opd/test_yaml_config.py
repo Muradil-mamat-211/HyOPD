@@ -8,7 +8,7 @@ from tokenizers.models import WordLevel
 from transformers import LlamaConfig, PreTrainedTokenizerFast
 
 from verl.trainer.distillation.full_vocab import validate_student
-from verl.workers.config import DistillationLossConfig
+from verl.workers.config import DistillationLossConfig, FullVocabularyOPDConfig
 
 
 def configure(monkeypatch, tmp_path):
@@ -63,6 +63,7 @@ def test_example_composes_and_instantiates_typed_configs(monkeypatch, tmp_path):
     assert teacher.inference.max_num_batched_tokens == 128
     assert typed.nnodes == 2 and typed.n_gpus_per_node == 5
     assert typed.distillation_loss.loss_settings.use_full_vocab
+    assert cfg.distillation.full_vocab_opd.alpha_max == typed.full_vocab_opd.alpha_max == 0.8
     assert not hasattr(typed, "teacher_engine") and not hasattr(typed, "teacher_model_config")
     validate_student(cfg, tokenizer)
     cfg.distillation.distillation_loss.use_task_rewards = True
@@ -81,3 +82,9 @@ def test_full_vocab_rejects_policy_gradient():
         loss_max_clamp=None,
     )
     assert cfg.loss_settings.use_full_vocab and not cfg.loss_settings.use_topk
+
+
+@pytest.mark.parametrize("alpha_max", [-0.01, 1.01, float("nan"), float("inf"), -float("inf")])
+def test_full_vocab_rejects_invalid_alpha_max(alpha_max):
+    with pytest.raises(ValueError, match="alpha_max"):
+        FullVocabularyOPDConfig(alpha_max=alpha_max)

@@ -85,6 +85,7 @@ distillation:
     top_p: 0.8
     coverage_ratio_threshold: 0.2
     coverage_threshold: 0.8
+    alpha_max: 0.8
     alpha_schedule: linear
     loss_compute_dtype: float32
     residual_eps: 1.0e-8

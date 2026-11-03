@@ -1,0 +1,110 @@
+CURRENT vLLM Teacher / FSDP2 Student implementation validation
+Workspace: /root/autodl-tmp/verl-full-vocab-opd
+
+RESOURCE CONSTRAINT
+AutoDL no-GPU mode; total host cgroup hard limit 2147483648 bytes.
+Tests run serially, with a stdlib monitor checking memory.current every 20 ms.
+The test process group is terminated at 1850 MiB, leaving headroom below 2 GiB.
+OMP_NUM_THREADS=1, OPENBLAS_NUM_THREADS=1, MKL_NUM_THREADS=1,
+NUMEXPR_NUM_THREADS=1, MALLOC_ARENA_MAX=2, PYTEST_DISABLE_PLUGIN_AUTOLOAD=1.
+No Ray or GPU test was launched after the 2-GB constraint was given.
+
+FINAL CPU COMMAND
+/usr/bin/python3 /tmp/opd_memory_guard.py /tmp/opd-vllm-regressions-2gb.log .venv/bin/python -m pytest -q -p pytest_asyncio.plugin tests/full_vocab_opd tests/utils/test_experimental_torch_functional_on_cpu.py tests/utils/test_transferqueue_utils_on_cpu.py tests/workers/test_distillation_topk_symmetry_on_cpu.py tests/workers/test_engine_forward_step_detach_on_cpu.py tests/trainer/ppo/v1/test_trainer_base_on_cpu.py tests/trainer/ppo/v1/test_checkpoint_callback_on_cpu.py tests/trainer/ppo/v1/test_rollout_profiling_on_cpu.py tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+
+FINAL RAW OUTPUT
+Host cgroup limit: 2147483648 bytes; stop threshold: 1939865600 bytes
+/root/autodl-tmp/verl-full-vocab-opd/.venv/lib/python3.12/site-packages/pytest_asyncio/plugin.py:300: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+........................s.s.s.s.s.s.s.s.s.s.s.s.s.s.s.s.s.s..sss........ [ 47%]
+........................................................................ [ 95%]
+.......                                                                  [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/ray/util/state/util.py:55
+  /root/autodl-tmp/verl-full-vocab-opd/.venv/lib/python3.12/site-packages/ray/util/state/util.py:55: DeprecationWarning: Ray state API is no longer experimental. Please import from `ray.util.state`. instead. Importing from `ray.experimental` will be deprecated in future releases. 
+    warnings.warn(
+
+verl/workers/engine/__init__.py:32
+  /root/autodl-tmp/verl-full-vocab-opd/verl/workers/engine/__init__.py:32: UserWarning: torchtitan engine is not available: ModuleNotFoundError("No module named 'torchtitan'")
+    warnings.warn(f"torchtitan engine is not available: {e!r}", stacklevel=1)
+
+verl/workers/engine/__init__.py:41
+  /root/autodl-tmp/verl-full-vocab-opd/verl/workers/engine/__init__.py:41: UserWarning: veomni engine is not available: ModuleNotFoundError("No module named 'veomni'")
+    warnings.warn(f"veomni engine is not available: {e!r}", stacklevel=1)
+
+verl/workers/engine/__init__.py:50
+  /root/autodl-tmp/verl-full-vocab-opd/verl/workers/engine/__init__.py:50: UserWarning: automodel engine is not available: ModuleNotFoundError("No module named 'nemo_automodel'")
+    warnings.warn(f"automodel engine is not available: {e!r}", stacklevel=1)
+
+verl/workers/engine/__init__.py:60
+  /root/autodl-tmp/verl-full-vocab-opd/verl/workers/engine/__init__.py:60: UserWarning: mindspeed engine is not available: ModuleNotFoundError("No module named 'megatron'")
+    warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+
+verl/workers/engine/__init__.py:69
+  /root/autodl-tmp/verl-full-vocab-opd/verl/workers/engine/__init__.py:69: UserWarning: megatron engine is not available: ModuleNotFoundError("No module named 'megatron'")
+    warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+130 passed, 21 skipped, 6 warnings in 20.01s
+
+Memory guard: peak total cgroup memory=1560.8 MiB, threshold=1850 MiB, stopped=False, returncode=0
+
+STATIC CHECKS
+Ruff check of changed implementation and tests: PASS
+Python AST syntax of new tests / integration files: PASS
+bash -n launcher and Liger installer: PASS
+git diff --check: PASS
+Liger 0.8.4 patch reverse-application --check: PASS
+Eight Student/math/operator source SHA256 values match pre-migration snapshot: PASS
+cgroup memory.events: max=0, oom=0, oom_kill=0
+
+REAL EXECUTION LIMITS
+Before the 2-GB constraint, one actual Ray/TQ test detected that TQ repacks
+equal-size teacher fields into a jagged NestedTensor. Production tqbridge now
+restores only the full-vocab teacher field to dense CPU before batch slicing.
+The final CPU tests run installed TQ's real storage packer and the production
+read conversion for B=1 and B=3. Only remote I/O is replaced in those cases.
+A post-fix actual Ray transport run did not produce a completed passing result;
+its opt-in test remains skipped here. The former FSDP teacher cache's Ray pass
+is not a passing result for this new implementation.
+No CUDA/vLLM engine/FSDP collective/H2D/throughput success is claimed.
+The CPU optimizer test runs an actual tiny Llama, unchanged Student Liger path,
+engine preparation, full-vocab loss, backward, gradient clipping and SGD update.
+
+MEMORY GUARD USED FOR THIS RUN
+"""Run one test process group, stopping before this host's 2-GiB memory limit."""
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+threshold = 1850 * 1024**2
+memory_file = Path('/sys/fs/cgroup/memory.current')
+env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1', MALLOC_ARENA_MAX='2', PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+log_path, *command = sys.argv[1:]
+peak = int(memory_file.read_text())
+with open(log_path, 'w', buffering=1) as log:
+    log.write(f'Host cgroup limit: {Path("/sys/fs/cgroup/memory.max").read_text().strip()} bytes; stop threshold: {threshold} bytes\n')
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
+    stopped = False
+    while process.poll() is None:
+        current = int(memory_file.read_text())
+        peak = max(peak, current)
+        if current >= threshold:
+            stopped = True
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            break
+        time.sleep(0.02)
+    code = process.wait()
+    log.write(f'\nMemory guard: peak total cgroup memory={peak / 1024**2:.1f} MiB, threshold={threshold / 1024**2:.0f} MiB, stopped={stopped}, returncode={code}\n')
+print(f'{log_path}: exit={code}, peak={peak / 1024**2:.1f} MiB, stopped={stopped}')
+sys.exit(99 if stopped else code)

@@ -1,0 +1,98 @@
+# @package _global_
+defaults:
+  - ppo_trainer
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+trainer:
+  use_v1: true
+  nnodes: ${oc.decode:${oc.env:OPD_STUDENT_NNODES}}
+  n_gpus_per_node: ${oc.decode:${oc.env:OPD_STUDENT_GPUS_PER_NODE}}
+  project_name: full-vocab-opd
+  experiment_name: coverage-adaptive
+  logger: [console]
+
+transfer_queue:
+  enable: true
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      ssd_offload:
+        enabled: false
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:OPD_STUDENT_MODEL}
+    use_remove_padding: true
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: liger
+  actor:
+    strategy: fsdp2
+    fsdp_config:
+      strategy: fsdp2
+      fsdp_size: ${oc.decode:${oc.env:OPD_STUDENT_FSDP_SIZE,-1}}
+    ppo_mini_batch_size: ${oc.decode:${oc.env:OPD_MINI_BATCH_SIZE}}
+    ppo_micro_batch_size_per_gpu: ${oc.decode:${oc.env:OPD_STUDENT_MICRO_BATCH,null}}
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: ${oc.decode:${oc.env:OPD_STUDENT_MAX_TOKENS}}
+    use_kl_loss: false
+    entropy_coeff: 0.0
+    loss_agg_mode: token-mean
+  rollout:
+    name: ${oc.env:OPD_ROLLOUT_ENGINE,vllm}
+    temperature: ${distillation.full_vocab_opd.temperature}
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${oc.decode:${oc.env:OPD_OLD_LOGPROB_MAX_TOKENS}}
+    log_prob_micro_batch_size_per_gpu: ${oc.decode:${oc.env:OPD_OLD_LOGPROB_MICRO_BATCH,null}}
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+data:
+  train_files: ${oc.env:OPD_TRAIN_FILES}
+  val_files: ${oc.env:OPD_VAL_FILES}
+  train_batch_size: ${oc.decode:${oc.env:OPD_TRAIN_BATCH_SIZE}}
+
+distillation:
+  enabled: true
+  execution_mode: full_vocab_vllm
+  nnodes: ${oc.decode:${oc.env:OPD_TEACHER_NNODES}}
+  n_gpus_per_node: ${oc.decode:${oc.env:OPD_TEACHER_GPUS_PER_NODE}}
+  teacher_models:
+    teacher_model:
+      model_path: ${oc.env:OPD_TEACHER_MODEL}
+      inference:
+        name: vllm
+        temperature: 1.0
+        logprobs_mode: raw_logprobs
+        dtype: ${oc.env:OPD_TEACHER_DTYPE,bfloat16}
+        tensor_model_parallel_size: ${oc.decode:${oc.env:OPD_TEACHER_TP_SIZE}}
+        data_parallel_size: ${oc.decode:${oc.env:OPD_TEACHER_DP_SIZE,1}}
+        max_num_batched_tokens: ${oc.decode:${oc.env:OPD_TEACHER_MAX_BATCHED_TOKENS}}
+        enable_chunked_prefill: true
+        engine_kwargs:
+          vllm:
+            max_logprobs: -1
+  teacher_cache:
+    dtype: ${oc.env:OPD_CACHE_DTYPE,float16}
+  full_vocab_opd:
+    temperature: 1.0
+    top_p: 0.8
+    coverage_ratio_threshold: 0.2
+    coverage_threshold: 0.8
+    alpha_schedule: linear
+    loss_compute_dtype: float32
+    residual_eps: 1.0e-8
+    use_mass_weighted_coverage: true
+  distillation_loss:
+    loss_mode: coverage_adaptive_full_vocab
+    use_task_rewards: false
+    use_policy_gradient: false
+    distillation_loss_coef: 1.0
+    loss_max_clamp: null
+    log_prob_min_clamp: null

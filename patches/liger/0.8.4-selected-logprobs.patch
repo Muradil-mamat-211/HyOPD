@@ -1,0 +1,1007 @@
+diff --git a/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_backward_fused_sm90.py b/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_backward_fused_sm90.py
+index c752283..2d4ba44 100644
+--- a/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_backward_fused_sm90.py
++++ b/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_backward_fused_sm90.py
+@@ -369,6 +369,7 @@ class FusedBackwardConfig:
+ 
+     fast_math: bool = True
+     with_entropy: bool = False
++    num_selected: int = 0
+ 
+     @property
+     def wave_rows(self):
+@@ -466,6 +467,7 @@ class _FusedBackwardSM90:
+         self.wave_rows = config.wave_rows
+         self.fast_math = config.fast_math
+         self.with_entropy = config.with_entropy
++        self.num_selected = config.num_selected
+ 
+         self.logit_dtype = Float16 if config.dz_logit_dtype == "f16" else BFloat16
+         self.logit_stride = config.logit_stride
+@@ -620,6 +622,9 @@ class _FusedBackwardSM90:
+         scale: cute.Tensor,
+         entropy: cute.Tensor,
+         entropy_scale: cute.Tensor,
++        selected_token_ids: cute.Tensor,
++        selected_scale: cute.Tensor,
++        selected_scale_sum: cute.Tensor,
+         inverse_temperature: Float32,
+         barrier: cute.Tensor,  # int32 [1]
+         ignore_index: Int32,
+@@ -774,6 +779,9 @@ class _FusedBackwardSM90:
+             scale,
+             entropy,
+             entropy_scale,
++            selected_token_ids,
++            selected_scale,
++            selected_scale_sum,
+             inverse_temperature,
+             barrier,
+             mma_dz,
+@@ -854,6 +862,9 @@ class _FusedBackwardSM90:
+         scale: cute.Tensor,
+         entropy: cute.Tensor,
+         entropy_scale: cute.Tensor,
++        selected_token_ids: cute.Tensor,
++        selected_scale: cute.Tensor,
++        selected_scale_sum: cute.Tensor,
+         inverse_temperature: Float32,
+         vals: cute.Tensor,
+         ignore_index: Int32,
+@@ -875,6 +886,8 @@ class _FusedBackwardSM90:
+             row_entropy_scale = Float32(0.0)
+             row_lse = Float32(0.0)
+             tgt_local = Int32(-1)
++            selected_active = Int32(0)
++            row_selected_sum = Float32(0.0)
+             if row < target.shape[0]:
+                 tcol = Int32(target[row])
+                 if tcol != ignore_index:
+@@ -885,6 +898,18 @@ class _FusedBackwardSM90:
+                         row_entropy_scale = entropy_scale[row]
+                     if tcol >= n_base and tcol < n_base + self.tile_n:
+                         tgt_local = tcol - n_base
++                    if cutlass.const_expr(self.num_selected > 0):
++                        selected_active = Int32(1)
++                        row_selected_sum = selected_scale_sum[row]
++            row_probability_scale = row_scale - row_selected_sum
++            if cutlass.const_expr(self.num_selected > 0):
++                selected_cols = cute.make_rmem_tensor((self.num_selected,), Int32)
++                selected_tile_active = Int32(0)
++                for k in cutlass.range_constexpr(self.num_selected):
++                    col = Int32(selected_token_ids[k]) - n_base
++                    selected_cols[k] = col
++                    if selected_active and col >= 0 and col < self.tile_n:
++                        selected_tile_active = Int32(1)
+ 
+             rstate = pipeline.PipelineState(1, Int32(0), cr_i, cr_p)
+             tile_pipe.consumer_wait(rstate)
+@@ -899,29 +924,38 @@ class _FusedBackwardSM90:
+                     v = Float32(0.0)
+                     if n_base + c0 + j < vocab_size:
+                         if cutlass.const_expr(self.with_entropy):
+-                            if row_scale != 0.0 or row_entropy_scale != 0.0:
++                            if row_probability_scale != 0.0 or row_entropy_scale != 0.0:
+                                 scaled_logit = vals[j] * inverse_temperature
+                                 probability = cute.math.exp2(
+                                     (scaled_logit - row_lse) * LOG2_E,
+                                     fastmath=self.fast_math,
+                                 )
+                                 v = probability * (
+-                                    row_scale + (row_lse - row_entropy - scaled_logit) * row_entropy_scale
++                                    row_probability_scale + (row_lse - row_entropy - scaled_logit) * row_entropy_scale
+                                 )
+                         else:
+-                            if row_scale != 0.0:
++                            if row_probability_scale != 0.0:
+                                 v = (
+                                     cute.math.exp2(
+                                         (vals[j] * inverse_temperature - row_lse) * LOG2_E,
+                                         fastmath=self.fast_math,
+                                     )
+-                                    * row_scale
++                                    * row_probability_scale
+                                 )
+                     vals[j] = v
+                 if tgt_local >= c0 and tgt_local < c0 + chunk:
+                     for j in cutlass.range_constexpr(chunk):
+                         if tgt_local == c0 + j:
+                             vals[j] = vals[j] - row_scale
++                if cutlass.const_expr(self.num_selected > 0):
++                    if selected_tile_active:
++                        for k in cutlass.range_constexpr(self.num_selected):
++                            col = selected_cols[k]
++                            if col >= c0 and col < c0 + chunk:
++                                selected_grad = selected_scale[row, k]
++                                for j in cutlass.range_constexpr(chunk):
++                                    if col == c0 + j:
++                                        vals[j] = vals[j] + selected_grad
+ 
+                 if local_warp == 0:
+                     cute.arch.cp_async_bulk_wait_group(self.dz_store_stages - 1, read=True)
+@@ -1518,6 +1552,9 @@ class _FusedBackwardSM90:
+         scale: cute.Tensor,
+         entropy: cute.Tensor,
+         entropy_scale: cute.Tensor,
++        selected_token_ids: cute.Tensor,
++        selected_scale: cute.Tensor,
++        selected_scale_sum: cute.Tensor,
+         inverse_temperature: Float32,
+         barrier: cute.Tensor,
+         mma_dz: cute.TiledMma,
+@@ -1745,6 +1782,9 @@ class _FusedBackwardSM90:
+                     scale,
+                     entropy,
+                     entropy_scale,
++                    selected_token_ids,
++                    selected_scale,
++                    selected_scale_sum,
+                     inverse_temperature,
+                     vals,
+                     ignore_index,
+@@ -1998,6 +2038,8 @@ def fused_backward_one_kernel(
+     temperature=1.0,
+     config: FusedBackwardConfig = None,
+     max_clusters=None,
++    selected_token_ids=None,
++    selected_grad=None,
+ ):
+     """One-launch dZ+dX+dW backward.  Returns ``(grad_input, grad_weight)``.
+ 
+@@ -2037,6 +2079,19 @@ def fused_backward_one_kernel(
+         entropy_scale = torch.empty(1, device=device, dtype=torch.float32)
+     if config.with_entropy != with_entropy:
+         config = FusedBackwardConfig(**{**config.__dict__, "with_entropy": with_entropy})
++    if selected_grad is not None and selected_token_ids is None:
++        raise ValueError("selected_token_ids is required with selected_grad")
++    num_selected = selected_token_ids.numel() if selected_grad is not None else 0
++    if selected_grad is not None and selected_grad.shape != (tokens, num_selected):
++        raise ValueError("selected_grad must have shape [M, K]")
++    if num_selected:
++        selected_scale = selected_grad.detach().float().contiguous()
++        selected_scale_sum = selected_scale.sum(-1)
++    else:
++        selected_scale = scale.view(tokens, 1)
++        selected_scale_sum = scale
++    if config.num_selected != num_selected:
++        config = FusedBackwardConfig(**{**config.__dict__, "num_selected": num_selected})
+     target = target.contiguous()
+     lse = lse.contiguous()
+ 
+@@ -2098,6 +2153,9 @@ def fused_backward_one_kernel(
+     scale_c = to_cute_tensor(scale, assumed_align=4)
+     entropy_c = to_cute_tensor(entropy, assumed_align=2)
+     entropy_scale_c = to_cute_tensor(entropy_scale, assumed_align=4)
++    selected_ids_c = to_cute_tensor(selected_token_ids if num_selected else target, assumed_align=8)
++    selected_scale_c = to_cute_tensor(selected_scale, leading_dim=1, assumed_align=4)
++    selected_sum_c = to_cute_tensor(selected_scale_sum, assumed_align=4)
+     inverse_temperature = Float32(1.0 / temperature)
+ 
+     # A single int32 counter, zeroed for this launch.  Each device-side barrier
+@@ -2125,6 +2183,9 @@ def fused_backward_one_kernel(
+             scale_c,
+             entropy_c,
+             entropy_scale_c,
++            selected_ids_c,
++            selected_scale_c,
++            selected_sum_c,
+             inverse_temperature,
+             bar_c,
+             Int32(ignore_index),
+@@ -2147,6 +2208,9 @@ def fused_backward_one_kernel(
+         scale_c,
+         entropy_c,
+         entropy_scale_c,
++        selected_ids_c,
++        selected_scale_c,
++        selected_sum_c,
+         inverse_temperature,
+         bar_c,
+         Int32(ignore_index),
+diff --git a/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_forward_fragment_sm90.py b/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_forward_fragment_sm90.py
+index 0a960af..6f831bb 100644
+--- a/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_forward_fragment_sm90.py
++++ b/src/liger_kernel/ops/cutedsl/ops/_fused_scaled_cross_entropy_forward_fragment_sm90.py
+@@ -49,6 +49,7 @@ from liger_kernel.ops.cutedsl.ops._fused_scaled_cross_entropy_utils_sm90 import
+ from liger_kernel.ops.cutedsl.ops._fused_scaled_cross_entropy_utils_sm90 import _pad_hidden
+ from liger_kernel.ops.cutedsl.ops._fused_scaled_cross_entropy_utils_sm90 import _validate
+ from liger_kernel.ops.cutedsl.ops.utils import to_cute_tensor
++from liger_kernel.ops.fused_linear_scaled_cross_entropy import _validate_selected_token_ids
+ 
+ THREADS_PER_CTA = 384
+ PRODUCER_WARP_GROUP = 0
+@@ -85,6 +86,7 @@ _compile_cache = {}
+ class ScaledCEForwardFragmentConfig:
+     """Vocabulary-split tuning for the fixed M128xN320 fragment kernel.
+ 
++    Split tuning is resolved on the host and passed to kernels at runtime.
+     ``return_entropy`` compile-time enables weighted softmax statistics.
+     """
+ 
+@@ -95,6 +97,7 @@ class ScaledCEForwardFragmentConfig:
+     extra_m_pairs: int = 0
+     target_cluster_pairs: int = 0
+     max_split_n: int = 9
++    num_selected: int = 0
+ 
+     def smem_bytes(self):
+         return SHARED_MEMORY_BYTES_BASE + (TILE_M if self.return_entropy else 1) * 4
+@@ -107,9 +110,7 @@ class _ScaledCEForwardFragmentSM90:
+     def __init__(self, config: ScaledCEForwardFragmentConfig):
+         self.fast_math = config.fast_math
+         self.return_entropy = config.return_entropy
+-        self.split_n = config.split_n
+-        self.base_split_n = config.base_split_n
+-        self.extra_m_pairs = config.extra_m_pairs
++        self.num_selected = config.num_selected
+         self.a_tile_shape = (TILE_M, ACCUMULATOR_N, TILE_K)
+         self.b_tile_shape = (TILE_M, ACCUMULATOR_N, TILE_K)
+         self.buffer_align = 1024
+@@ -144,6 +145,11 @@ class _ScaledCEForwardFragmentSM90:
+         partial_sum: cute.Tensor,
+         partial_target: cute.Tensor,
+         partial_weighted: cute.Tensor,
++        selected_token_ids: cute.Tensor,
++        selected_log_probs: cute.Tensor,
++        split_n: Int32,
++        base_split_n: Int32,
++        extra_m_pairs: Int32,
+         inverse_temperature: Float32,
+         stream: cuda.CUstream,
+     ):
+@@ -211,7 +217,7 @@ class _ScaledCEForwardFragmentSM90:
+         self.shared_storage = SharedStorage
+         num_m_tiles = cute.ceil_div(x.shape[0], TILE_M)
+         num_m_pairs = cute.ceil_div(num_m_tiles, CLUSTER_M)
+-        num_cluster_pairs = num_m_pairs * self.base_split_n + self.extra_m_pairs
++        num_cluster_pairs = num_m_pairs * base_split_n + extra_m_pairs
+         grid = (CLUSTER_M, 1, num_cluster_pairs)
+         self.kernel(
+             tma_x,
+@@ -223,6 +229,11 @@ class _ScaledCEForwardFragmentSM90:
+             partial_sum,
+             partial_target,
+             partial_weighted,
++            selected_token_ids,
++            selected_log_probs,
++            split_n,
++            base_split_n,
++            extra_m_pairs,
+             inverse_temperature,
+             tiled_mma,
+             a_smem_layout,
+@@ -269,6 +280,9 @@ class _ScaledCEForwardFragmentSM90:
+         run_sum: Float32,
+         run_target: Float32,
+         run_weighted: Float32,
++        selected_token_ids: cute.Tensor,
++        selected_log_probs: cute.Tensor,
++        selected_row: Int32,
+     ):
+         segment_n = EPILOGUE_SLICE_N // 2
+         segment_base = segment * segment_n
+@@ -326,6 +340,14 @@ class _ScaledCEForwardFragmentSM90:
+         target_end = target_begin + segment_n
+         if target_col >= target_begin and target_col < target_end:
+             run_target += Float32(s_logits[buffer, row, target_col - slice_global_base]) * inverse_temperature
++        if cutlass.const_expr(self.num_selected > 0):
++            if selected_row >= 0:
++                for k in cutlass.range_constexpr(self.num_selected):
++                    col = Int32(selected_token_ids[k])
++                    if col >= target_begin and col < target_end:
++                        selected_log_probs[selected_row, k] = (
++                            Float32(s_logits[buffer, row, col - slice_global_base]) * inverse_temperature
++                        )
+         return run_max, run_sum, run_target, run_weighted
+ 
+     @cute.kernel
+@@ -340,6 +362,11 @@ class _ScaledCEForwardFragmentSM90:
+         output_partial_sum: cute.Tensor,
+         output_partial_target: cute.Tensor,
+         output_partial_weighted: cute.Tensor,
++        selected_token_ids: cute.Tensor,
++        selected_log_probs: cute.Tensor,
++        split_n: Int32,
++        base_split_n: Int32,
++        extra_m_pairs: Int32,
+         inverse_temperature: Float32,
+         tiled_mma: cute.TiledMma,
+         a_smem_layout: cute.ComposedLayout,
+@@ -355,28 +382,22 @@ class _ScaledCEForwardFragmentSM90:
+         _, _, cluster_work = cute.arch.block_idx()
+ 
+         num_m_tiles = cute.ceil_div(target.shape[0], TILE_M)
+-        if cutlass.const_expr(self.extra_m_pairs == 0):
+-            m_pair = cluster_work // self.base_split_n
+-            split_id = cluster_work % self.base_split_n
+-            split_count = self.base_split_n
++        extra_work = extra_m_pairs * split_n
++        m_pair = Int32(0)
++        split_id = Int32(0)
++        split_count = base_split_n
++        if cluster_work < extra_work:
++            m_pair = cluster_work // split_n
++            split_id = cluster_work % split_n
++            split_count = split_n
+         else:
+-            extra_work = self.extra_m_pairs * self.split_n
+-            m_pair = Int32(0)
+-            split_id = Int32(0)
+-            split_count = Int32(self.base_split_n)
+-            if cluster_work < extra_work:
+-                m_pair = cluster_work // self.split_n
+-                split_id = cluster_work % self.split_n
+-                split_count = Int32(self.split_n)
+-            else:
+-                normal_work = cluster_work - extra_work
+-                m_pair = self.extra_m_pairs + normal_work // self.base_split_n
+-                split_id = normal_work % self.base_split_n
+-                split_count = Int32(self.base_split_n)
++            normal_work = cluster_work - extra_work
++            m_pair = extra_m_pairs + normal_work // base_split_n
++            split_id = normal_work % base_split_n
+         raw_pid_m = m_pair * CLUSTER_M + cluster_rank
+         store_enabled = raw_pid_m < num_m_tiles
+         pid_m = cutlass.min(raw_pid_m, num_m_tiles - 1)
+-        output_work = raw_pid_m * self.split_n + split_id
++        output_work = raw_pid_m * split_n + split_id
+ 
+         if warp == 0:
+             cute.nvgpu.cpasync.prefetch_descriptor(tma_x)
+@@ -528,8 +549,10 @@ class _ScaledCEForwardFragmentSM90:
+             epi_segment = local_tid // 64
+             global_row = raw_pid_m * TILE_M + epi_row
+             target_col = Int32(-1)
++            selected_row = Int32(-1)
+             if store_enabled and global_row < target.shape[0]:
+                 target_col = Int32(target[global_row])
++                selected_row = global_row
+ 
+             run_max = Float32(NEG_INF_F32)
+             run_sum = Float32(0.0)
+@@ -636,6 +659,9 @@ class _ScaledCEForwardFragmentSM90:
+                     run_sum,
+                     run_target,
+                     run_weighted,
++                    selected_token_ids,
++                    selected_log_probs,
++                    selected_row,
+                 )
+                 self.epilogue_barrier.arrive_and_wait()
+                 self._stage_slice(accum1, s_logits, Int32(0), row_base, col_base, Int32(0))
+@@ -652,6 +678,9 @@ class _ScaledCEForwardFragmentSM90:
+                     run_sum,
+                     run_target,
+                     run_weighted,
++                    selected_token_ids,
++                    selected_log_probs,
++                    selected_row,
+                 )
+                 self.epilogue_barrier.arrive_and_wait()
+                 self._stage_slice(
+@@ -675,6 +704,9 @@ class _ScaledCEForwardFragmentSM90:
+                     run_sum,
+                     run_target,
+                     run_weighted,
++                    selected_token_ids,
++                    selected_log_probs,
++                    selected_row,
+                 )
+                 self.epilogue_barrier.arrive_and_wait()
+                 run_max, run_sum, run_target, run_weighted = self._fold_slice(
+@@ -690,6 +722,9 @@ class _ScaledCEForwardFragmentSM90:
+                     run_sum,
+                     run_target,
+                     run_weighted,
++                    selected_token_ids,
++                    selected_log_probs,
++                    selected_row,
+                 )
+                 self.epilogue_barrier.arrive_and_wait()
+ 
+@@ -733,12 +768,10 @@ class _ScaledCEForwardFragmentSM90:
+ class _ScaledCEForwardFragmentFinalizeSM90:
+     """Combine split vocabulary statistics into final NLL/LSE/entropy."""
+ 
+-    def __init__(self, split_n, base_split_n, extra_m_pairs, fast_math, return_entropy):
+-        self.split_n = split_n
+-        self.base_split_n = base_split_n
+-        self.extra_m_pairs = extra_m_pairs
++    def __init__(self, fast_math, return_entropy, num_selected=0):
+         self.fast_math = fast_math
+         self.return_entropy = return_entropy
++        self.num_selected = num_selected
+ 
+     @cute.jit
+     def __call__(
+@@ -751,6 +784,10 @@ class _ScaledCEForwardFragmentFinalizeSM90:
+         lse: cute.Tensor,
+         token_loss: cute.Tensor,
+         entropy: cute.Tensor,
++        selected_log_probs: cute.Tensor,
++        split_n: Int32,
++        base_split_n: Int32,
++        extra_m_pairs: Int32,
+         ignore_index: Int32,
+         stream: cuda.CUstream,
+     ):
+@@ -764,6 +801,10 @@ class _ScaledCEForwardFragmentFinalizeSM90:
+             lse,
+             token_loss,
+             entropy,
++            selected_log_probs,
++            split_n,
++            base_split_n,
++            extra_m_pairs,
+             ignore_index,
+         ).launch(
+             grid=(num_m_tiles, 1, 1),
+@@ -783,43 +824,41 @@ class _ScaledCEForwardFragmentFinalizeSM90:
+         lse: cute.Tensor,
+         token_loss: cute.Tensor,
+         entropy: cute.Tensor,
++        selected_log_probs: cute.Tensor,
++        split_n: Int32,
++        base_split_n: Int32,
++        extra_m_pairs: Int32,
+         ignore_index: Int32,
+     ):
+         tid, _, _ = cute.arch.thread_idx()
+         pid_m, _, _ = cute.arch.block_idx()
+         row = pid_m * TILE_M + tid
+-        if cutlass.const_expr(self.extra_m_pairs == 0):
+-            split_count = self.base_split_n
+-        else:
+-            m_pair = pid_m // CLUSTER_M
+-            split_count = Int32(self.base_split_n)
+-            if m_pair < self.extra_m_pairs:
+-                split_count = Int32(self.split_n)
++        split_count = base_split_n
++        if pid_m // CLUSTER_M < extra_m_pairs:
++            split_count = split_n
+         row_max = Float32(NEG_INF_F32)
+         row_target = Float32(0.0)
+-        for split_id in cutlass.range_constexpr(self.split_n):
+-            if split_id < split_count:
+-                work_id = pid_m * self.split_n + split_id
+-                row_max = _fmax(row_max, partial_max[work_id, tid])
+-                row_target += partial_target[work_id, tid]
++        for split_id in range(split_count):
++            work_id = pid_m * split_n + split_id
++            row_max = _fmax(row_max, partial_max[work_id, tid])
++            row_target += partial_target[work_id, tid]
+ 
+         row_sum = Float32(0.0)
+         row_weighted = Float32(0.0)
+-        for split_id in cutlass.range_constexpr(self.split_n):
+-            if split_id < split_count:
+-                work_id = pid_m * self.split_n + split_id
+-                if cutlass.const_expr(self.return_entropy):
+-                    split_scale = cute.math.exp2(
+-                        (partial_max[work_id, tid] - row_max) * LOG2_E,
+-                        fastmath=self.fast_math,
+-                    )
+-                    row_sum += partial_sum[work_id, tid] * split_scale
+-                    row_weighted += partial_weighted[work_id, tid] * split_scale
+-                else:
+-                    row_sum += partial_sum[work_id, tid] * cute.math.exp2(
+-                        (partial_max[work_id, tid] - row_max) * LOG2_E,
+-                        fastmath=self.fast_math,
+-                    )
++        for split_id in range(split_count):
++            work_id = pid_m * split_n + split_id
++            if cutlass.const_expr(self.return_entropy):
++                split_scale = cute.math.exp2(
++                    (partial_max[work_id, tid] - row_max) * LOG2_E,
++                    fastmath=self.fast_math,
++                )
++                row_sum += partial_sum[work_id, tid] * split_scale
++                row_weighted += partial_weighted[work_id, tid] * split_scale
++            else:
++                row_sum += partial_sum[work_id, tid] * cute.math.exp2(
++                    (partial_max[work_id, tid] - row_max) * LOG2_E,
++                    fastmath=self.fast_math,
++                )
+ 
+         if row < target.shape[0]:
+             row_lse = row_max + cute.math.log2(row_sum, fastmath=self.fast_math) * LN2
+@@ -828,10 +867,14 @@ class _ScaledCEForwardFragmentFinalizeSM90:
+                 token_loss[row] = Float32(0.0)
+                 if cutlass.const_expr(self.return_entropy):
+                     entropy[row] = BFloat16(0.0)
++                for k in cutlass.range_constexpr(self.num_selected):
++                    selected_log_probs[row, k] = Float32(0.0)
+             else:
+                 token_loss[row] = row_lse - row_target
+                 if cutlass.const_expr(self.return_entropy):
+                     entropy[row] = BFloat16(row_lse - row_weighted / row_sum)
++                for k in cutlass.range_constexpr(self.num_selected):
++                    selected_log_probs[row, k] = selected_log_probs[row, k] - row_lse
+ 
+ 
+ def _resolve_split(config, tokens, vocab_size):
+@@ -868,13 +911,18 @@ def scaled_ce_forward_fragment(
+     ignore_index=-100,
+     return_entropy=False,
+     config: ScaledCEForwardFragmentConfig = None,
++    selected_token_ids=None,
+ ):
+     """Run the fixed two-N160/four-N80 fragment forward."""
+     _validate(_input, weight, target)
++    selected_token_ids = _validate_selected_token_ids(selected_token_ids, weight)
++    num_selected = selected_token_ids.numel() if selected_token_ids is not None else 0
+     if config is None:
+         config = ScaledCEForwardFragmentConfig()
+     if config.return_entropy != return_entropy:
+         config = replace(config, return_entropy=return_entropy)
++    if config.num_selected != num_selected:
++        config = replace(config, num_selected=num_selected)
+     if min(config.split_n, config.base_split_n, config.extra_m_pairs, config.target_cluster_pairs) < 0:
+         raise ValueError("split and cluster tuning values must be non-negative")
+     if config.max_split_n < 1:
+@@ -904,13 +952,6 @@ def scaled_ce_forward_fragment(
+     num_m_pairs = (num_m_tiles + CLUSTER_M - 1) // CLUSTER_M
+     if extra_m_pairs >= num_m_pairs or split_n != base_split_n + int(extra_m_pairs != 0):
+         raise ValueError("uneven split tuning must use split_n=base_split_n+1 for a proper subset of M pairs")
+-    config = replace(
+-        config,
+-        split_n=split_n,
+-        base_split_n=base_split_n,
+-        extra_m_pairs=extra_m_pairs,
+-    )
+-
+     partial_shape = (num_m_tiles * split_n, TILE_M)
+     partial_max = torch.empty(partial_shape, device=_input.device, dtype=torch.float32)
+     partial_sum = torch.empty_like(partial_max)
+@@ -926,6 +967,7 @@ def scaled_ce_forward_fragment(
+     )
+     lse = torch.empty(tokens, device=_input.device, dtype=torch.float32)
+     token_loss = torch.empty(tokens, device=_input.device, dtype=torch.float32)
++    selected = token_loss.new_empty(tokens, num_selected) if selected_token_ids is not None else None
+     entropy = torch.empty(
+         tokens if return_entropy else 1,
+         device=_input.device,
+@@ -946,10 +988,14 @@ def scaled_ce_forward_fragment(
+     lse_cute = to_cute_tensor(lse, assumed_align=4)
+     token_loss_cute = to_cute_tensor(token_loss, assumed_align=4)
+     entropy_cute = to_cute_tensor(entropy, assumed_align=2)
++    selected_ids_cute = to_cute_tensor(selected_token_ids if num_selected else target, assumed_align=8)
++    selected_cute = to_cute_tensor(
++        selected if num_selected else token_loss.view(tokens, 1), leading_dim=1, assumed_align=4
++    )
+     stream = _cute_stream()
+     inverse_temperature = Float32(1.0 / temperature)
+ 
+-    key = ("scaled_ce_forward_fragment", config)
++    key = ("scaled_ce_forward_fragment", config.fast_math, config.return_entropy, num_selected)
+     compiled = _compile_cache.get(key)
+     if compiled is None:
+         compiled = cute.compile(
+@@ -961,6 +1007,11 @@ def scaled_ce_forward_fragment(
+             partial_sum_cute,
+             partial_target_cute,
+             partial_weighted_cute,
++            selected_ids_cute,
++            selected_cute,
++            Int32(split_n),
++            Int32(base_split_n),
++            Int32(extra_m_pairs),
+             inverse_temperature,
+             stream,
+         )
+@@ -973,27 +1024,28 @@ def scaled_ce_forward_fragment(
+         partial_sum_cute,
+         partial_target_cute,
+         partial_weighted_cute,
++        selected_ids_cute,
++        selected_cute,
++        Int32(split_n),
++        Int32(base_split_n),
++        Int32(extra_m_pairs),
+         inverse_temperature,
+         stream,
+     )
+ 
+     finalize_key = (
+         "scaled_ce_forward_fragment_finalize",
+-        split_n,
+-        base_split_n,
+-        extra_m_pairs,
+         config.fast_math,
+         config.return_entropy,
++        num_selected,
+     )
+     finalize = _compile_cache.get(finalize_key)
+     if finalize is None:
+         finalize = cute.compile(
+             _ScaledCEForwardFragmentFinalizeSM90(
+-                split_n,
+-                base_split_n,
+-                extra_m_pairs,
+                 config.fast_math,
+                 config.return_entropy,
++                num_selected,
+             ),
+             partial_max_cute,
+             partial_sum_cute,
+@@ -1003,6 +1055,10 @@ def scaled_ce_forward_fragment(
+             lse_cute,
+             token_loss_cute,
+             entropy_cute,
++            selected_cute,
++            Int32(split_n),
++            Int32(base_split_n),
++            Int32(extra_m_pairs),
+             Int32(ignore_index),
+             stream,
+         )
+@@ -1016,7 +1072,12 @@ def scaled_ce_forward_fragment(
+         lse_cute,
+         token_loss_cute,
+         entropy_cute,
++        selected_cute,
++        Int32(split_n),
++        Int32(base_split_n),
++        Int32(extra_m_pairs),
+         Int32(ignore_index),
+         stream,
+     )
+-    return token_loss, entropy if return_entropy else None, lse
++    outputs = (token_loss, entropy if return_entropy else None, lse)
++    return outputs + (selected,) if selected is not None else outputs
+diff --git a/src/liger_kernel/ops/cutedsl/ops/fused_scaled_cross_entropy_sm90.py b/src/liger_kernel/ops/cutedsl/ops/fused_scaled_cross_entropy_sm90.py
+index ef77d18..6a1fd78 100644
+--- a/src/liger_kernel/ops/cutedsl/ops/fused_scaled_cross_entropy_sm90.py
++++ b/src/liger_kernel/ops/cutedsl/ops/fused_scaled_cross_entropy_sm90.py
+@@ -75,6 +75,7 @@ from liger_kernel.ops.cutedsl.ops._fused_scaled_cross_entropy_backward_fused_sm9
+ from liger_kernel.ops.cutedsl.ops._fused_scaled_cross_entropy_forward_fragment_sm90 import ScaledCEForwardFragmentConfig
+ from liger_kernel.ops.cutedsl.ops._fused_scaled_cross_entropy_forward_fragment_sm90 import scaled_ce_forward_fragment
+ from liger_kernel.ops.cutedsl.ops.utils import ensure_cuda_context
++from liger_kernel.ops.fused_linear_scaled_cross_entropy import _scaled_ce_outputs
+ from liger_kernel.ops.utils import amp_custom_bwd
+ from liger_kernel.ops.utils import amp_custom_fwd
+ 
+@@ -175,13 +176,14 @@ def fused_scaled_cross_entropy_forward(
+     ignore_index=-100,
+     m_tiles_per_cluster=1,
+     return_entropy=False,
++    selected_token_ids=None,
+ ):
+     """Per-token fused scaled cross entropy forward.
+ 
+     Returns ``(nll, entropy, lse, x_padded, weight_padded, hidden_size)``.
+     ``nll`` is the ``[M]`` FP32 negative log-likelihood, ``entropy`` is BF16
+     when requested (otherwise ``None``), and ``lse`` is the FP32 log-sum-exp
+-    reused by backward.
++    reused by backward. Supplied selected IDs append an FP32 ``[M,K]`` output.
+     """
+     _validate_inputs(_input, weight, target, ignore_index, m_tiles_per_cluster)
+     _validate_temperature(temperature)
+@@ -191,7 +193,8 @@ def fused_scaled_cross_entropy_forward(
+     x_padded, weight_padded, hidden_size = _pad_hidden(_input, weight)
+     target = target.contiguous()
+ 
+-    nll, entropy, lse = scaled_ce_forward_fragment(
++    selected_kwargs = {"selected_token_ids": selected_token_ids} if selected_token_ids is not None else {}
++    outputs = scaled_ce_forward_fragment(
+         x_padded,
+         weight_padded,
+         target,
+@@ -204,8 +207,11 @@ def fused_scaled_cross_entropy_forward(
+             weight_padded.shape[0],
+             return_entropy,
+         ),
++        **selected_kwargs,
+     )
+-    return nll, entropy, lse, x_padded, weight_padded, hidden_size
++    nll, entropy, lse = outputs[:3]
++    result = (nll, entropy, lse, x_padded, weight_padded, hidden_size)
++    return result + (outputs[3],) if selected_token_ids is not None else result
+ 
+ 
+ def fused_scaled_cross_entropy_backward(
+@@ -220,6 +226,8 @@ def fused_scaled_cross_entropy_backward(
+     entropy=None,
+     grad_entropy=None,
+     input_dtype=torch.bfloat16,
++    selected_token_ids=None,
++    grad_selected=None,
+ ):
+     """Backward of :func:`fused_scaled_cross_entropy_forward`.
+ 
+@@ -241,6 +249,9 @@ def fused_scaled_cross_entropy_backward(
+     entropy_scale = None
+     if grad_entropy is not None:
+         entropy_scale = (grad_entropy.detach().to(torch.float32) / temperature).contiguous()
++    selected_scale = None
++    if grad_selected is not None:
++        selected_scale = (grad_selected.detach().to(torch.float32) / temperature).contiguous()
+     total_m_tiles = (tokens + BACKWARD_M_TILE - 1) // BACKWARD_M_TILE
+     m_tiles_per_wave = min(BACKWARD_M_TILES_PER_WAVE, total_m_tiles)
+     return fused_backward_one_kernel(
+@@ -256,16 +267,20 @@ def fused_scaled_cross_entropy_backward(
+         input_dtype,
+         temperature,
+         config=FusedBackwardConfig(m_tiles_per_wave=m_tiles_per_wave),
++        selected_token_ids=selected_token_ids,
++        selected_grad=selected_scale,
+     )
+ 
+ 
+ class LigerFusedScaledCrossEntropySM90Function(torch.autograd.Function):
+     """``apply(_input, weight, target, temperature=1.0, ignore_index=-100,
+-    m_tiles_per_cluster=1, return_entropy=False)``.
++    m_tiles_per_cluster=1, return_entropy=False, selected_token_ids=None)``.
+ 
+     Forward returns the per-token NLL ``[M]`` (FP32).  Backward expects the
+     per-token upstream gradient ``[M]``.  ``m_tiles_per_cluster`` is retained
+     for API compatibility; backward always uses fixed 1024-token waves.
++    Selected IDs append differentiable FP32 log-probabilities ``[M,K]`` using
++    the same FP16-staged projection and full-vocabulary normalizer as NLL.
+     """
+ 
+     @staticmethod
+@@ -279,10 +294,11 @@ class LigerFusedScaledCrossEntropySM90Function(torch.autograd.Function):
+         ignore_index=-100,
+         m_tiles_per_cluster=1,
+         return_entropy=False,
++        selected_token_ids=None,
+     ):
+         ctx.set_materialize_grads(False)
+         _validate_temperature(temperature)
+-        nll, entropy, lse, x_padded, weight_padded, hidden_size = fused_scaled_cross_entropy_forward(
++        outputs = fused_scaled_cross_entropy_forward(
+             _input,
+             weight,
+             target,
+@@ -290,20 +306,26 @@ class LigerFusedScaledCrossEntropySM90Function(torch.autograd.Function):
+             ignore_index,
+             m_tiles_per_cluster,
+             return_entropy,
++            selected_token_ids,
+         )
++        nll, entropy, lse, x_padded, weight_padded, hidden_size = outputs[:6]
++        selected = outputs[6] if selected_token_ids is not None else None
++        selected_token_ids = selected_token_ids.contiguous() if selected_token_ids is not None else None
+         saved_entropy = entropy if entropy is not None else torch.empty(0, device=_input.device, dtype=torch.bfloat16)
+-        ctx.save_for_backward(x_padded, weight_padded, target, lse, saved_entropy)
++        ctx.save_for_backward(x_padded, weight_padded, target, lse, saved_entropy, selected_token_ids)
+         ctx.ignore_index = ignore_index
+         ctx.temperature = temperature
+         ctx.hidden_size = hidden_size
+         ctx.input_dtype = _input.dtype
+         ctx.return_entropy = return_entropy
+-        return (nll, entropy) if return_entropy else nll
++        return _scaled_ce_outputs(nll, entropy, selected)
+ 
+     @staticmethod
+     @amp_custom_bwd
+-    def backward(ctx, grad_output, grad_entropy=None):
+-        x_padded, weight_padded, target, lse, entropy = ctx.saved_tensors
++    def backward(ctx, grad_output, grad_entropy=None, grad_selected=None):
++        x_padded, weight_padded, target, lse, entropy, selected_token_ids = ctx.saved_tensors
++        if not ctx.return_entropy:
++            grad_selected, grad_entropy = grad_entropy, None
+         if grad_output is None:
+             grad_output = torch.zeros(target.shape[0], device=target.device, dtype=torch.float32)
+         grad_input, grad_weight = fused_scaled_cross_entropy_backward(
+@@ -318,8 +340,10 @@ class LigerFusedScaledCrossEntropySM90Function(torch.autograd.Function):
+             entropy=entropy if ctx.return_entropy else None,
+             grad_entropy=grad_entropy,
+             input_dtype=ctx.input_dtype,
++            selected_token_ids=selected_token_ids,
++            grad_selected=grad_selected,
+         )
+-        return grad_input, grad_weight, None, None, None, None, None
++        return grad_input, grad_weight, None, None, None, None, None, None
+ 
+ 
+ __all__ = [
+diff --git a/src/liger_kernel/ops/fused_linear_scaled_cross_entropy.py b/src/liger_kernel/ops/fused_linear_scaled_cross_entropy.py
+index 16d8260..90b2426 100644
+--- a/src/liger_kernel/ops/fused_linear_scaled_cross_entropy.py
++++ b/src/liger_kernel/ops/fused_linear_scaled_cross_entropy.py
+@@ -33,6 +33,29 @@ def _validate_temperature(temperature):
+         raise ValueError("temperature must be finite and > 0")
+ 
+ 
++def _validate_selected_token_ids(selected_token_ids, weight):
++    if selected_token_ids is None:
++        return None
++    if not isinstance(selected_token_ids, torch.Tensor):
++        raise TypeError("selected_token_ids must be an int64 tensor")
++    if selected_token_ids.ndim != 1:
++        raise ValueError("selected_token_ids must have shape [K]")
++    if selected_token_ids.dtype != torch.int64:
++        raise TypeError("selected_token_ids must be an int64 tensor")
++    if selected_token_ids.device != weight.device:
++        raise ValueError("selected_token_ids and weight must be on the same device")
++    if bool(((selected_token_ids < 0) | (selected_token_ids >= weight.shape[0])).any()):
++        raise ValueError(f"selected_token_ids must be in [0, {weight.shape[0]})")
++    return selected_token_ids.contiguous()
++
++
++def _scaled_ce_outputs(nll, entropy, selected_log_probs):
++    outputs = (nll,) if entropy is None else (nll, entropy)
++    if selected_log_probs is not None:
++        outputs += (selected_log_probs,)
++    return outputs[0] if len(outputs) == 1 else outputs
++
++
+ def _validate_fallback_inputs(_input, weight, target, ignore_index):
+     if _input.ndim != 2 or weight.ndim != 2 or target.ndim != 1:
+         raise ValueError("expected input[M,H], weight[V,H], and target[M]")
+@@ -216,7 +239,7 @@ def _apply_tp_fallback(_input, weight, target, temperature, ignore_index, return
+     )
+ 
+ 
+-def _fallback_forward_chunk(hidden_states, vocab_weights, input_ids, valid, temperature):
++def _fallback_forward_chunk(hidden_states, vocab_weights, input_ids, valid, temperature, selected_token_ids=None):
+     logits = (hidden_states @ vocab_weights.t()) / temperature
+     output_dtype = logits.dtype
+     logits = logits.to(torch.float32)
+@@ -226,10 +249,14 @@ def _fallback_forward_chunk(hidden_states, vocab_weights, input_ids, valid, temp
+     log_probs = logits.log_softmax(dim=-1)
+     token_log_probs = log_probs.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
+ 
+-    return (
++    outputs = (
+         torch.where(valid, -token_log_probs, torch.zeros_like(token_log_probs)),
+         torch.where(valid, entropy, torch.zeros_like(entropy)).to(output_dtype),
+     )
++    if selected_token_ids is not None:
++        selected = log_probs.index_select(1, selected_token_ids).masked_fill(~valid[:, None], 0.0)
++        outputs += (selected,)
++    return outputs
+ 
+ 
+ def _fallback_backward_chunk(
+@@ -240,6 +267,8 @@ def _fallback_backward_chunk(
+     input_ids,
+     valid,
+     temperature,
++    selected_token_ids=None,
++    grad_selected=None,
+ ):
+     logits = (hidden_states @ vocab_weights.t()) / temperature
+     output_dtype = logits.dtype
+@@ -258,43 +287,58 @@ def _fallback_backward_chunk(
+         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+         grad_logits.add_(probs * (log_probs + entropy.unsqueeze(-1)) * (-grad_entropy.unsqueeze(-1)))
+ 
++    if grad_selected is not None:
++        selected_grad = grad_selected.float().masked_fill(~valid[:, None], 0.0)
++        grad_logits.sub_(probs * selected_grad.sum(-1, keepdim=True))
++        grad_logits.scatter_add_(1, selected_token_ids.expand(hidden_states.shape[0], -1), selected_grad)
++
+     grad_logits = grad_logits.to(output_dtype) / temperature
+     return grad_logits @ vocab_weights, grad_logits.t() @ hidden_states
+ 
+ 
+ class _FusedLinearPPOFallbackFunction(torch.autograd.Function):
+     @staticmethod
+-    def forward(ctx, hidden_states, vocab_weights, input_ids, temperature, ignore_index, return_entropy):
++    def forward(
++        ctx, hidden_states, vocab_weights, input_ids, temperature, ignore_index, return_entropy, selected_token_ids=None
++    ):
+         ctx.set_materialize_grads(False)
+         _validate_fallback_inputs(hidden_states, vocab_weights, input_ids, ignore_index)
+         _validate_temperature(temperature)
++        selected_token_ids = _validate_selected_token_ids(selected_token_ids, vocab_weights)
+ 
+         valid = input_ids != ignore_index
+         safe_input_ids = input_ids.masked_fill(~valid, 0)
+         token_count = hidden_states.shape[0]
+         nll = torch.empty(token_count, device=hidden_states.device, dtype=torch.float32)
+         entropy = hidden_states.new_empty(token_count) if return_entropy else None
++        selected = nll.new_empty(token_count, selected_token_ids.numel()) if selected_token_ids is not None else None
+ 
+         for start in range(0, token_count, _FALLBACK_CHUNK_SIZE):
+             end = min(start + _FALLBACK_CHUNK_SIZE, token_count)
+-            chunk_nll, chunk_entropy = _fallback_forward_chunk(
++            chunk_outputs = _fallback_forward_chunk(
+                 hidden_states[start:end],
+                 vocab_weights,
+                 safe_input_ids[start:end],
+                 valid[start:end],
+                 temperature,
++                selected_token_ids,
+             )
+-            nll[start:end] = chunk_nll
++            nll[start:end] = chunk_outputs[0]
+             if return_entropy:
+-                entropy[start:end] = chunk_entropy
++                entropy[start:end] = chunk_outputs[1]
++            if selected is not None:
++                selected[start:end] = chunk_outputs[2]
+ 
+-        ctx.save_for_backward(hidden_states, vocab_weights, safe_input_ids, valid)
++        ctx.save_for_backward(hidden_states, vocab_weights, safe_input_ids, valid, selected_token_ids)
+         ctx.temperature = temperature
+-        return (nll, entropy) if return_entropy else nll
++        ctx.return_entropy = return_entropy
++        return _scaled_ce_outputs(nll, entropy, selected)
+ 
+     @staticmethod
+-    def backward(ctx, grad_nll, grad_entropy=None):
+-        hidden_states, vocab_weights, input_ids, valid = ctx.saved_tensors
++    def backward(ctx, grad_nll, grad_entropy=None, grad_selected=None):
++        hidden_states, vocab_weights, input_ids, valid, selected_token_ids = ctx.saved_tensors
++        if not ctx.return_entropy:
++            grad_selected, grad_entropy = grad_entropy, None
+         grad_hidden_states = torch.zeros_like(hidden_states) if ctx.needs_input_grad[0] else None
+         grad_vocab_weights = torch.zeros_like(vocab_weights) if ctx.needs_input_grad[1] else None
+ 
+@@ -308,13 +352,15 @@ class _FusedLinearPPOFallbackFunction(torch.autograd.Function):
+                 input_ids[start:end],
+                 valid[start:end],
+                 ctx.temperature,
++                selected_token_ids,
++                grad_selected[start:end] if grad_selected is not None else None,
+             )
+             if grad_hidden_states is not None:
+                 grad_hidden_states[start:end].add_(chunk_grad_hidden)
+             if grad_vocab_weights is not None:
+                 grad_vocab_weights.add_(chunk_grad_weight)
+ 
+-        return grad_hidden_states, grad_vocab_weights, None, None, None, None
++        return grad_hidden_states, grad_vocab_weights, None, None, None, None, None
+ 
+ 
+ def _resolve_implementation(device):
+@@ -328,7 +374,12 @@ def _resolve_implementation(device):
+ 
+ 
+ class LigerFusedLinearScaledCrossEntropyFunction:
+-    """Dispatch fused scaled cross entropy to the implementation for ``input.device``."""
++    """Per-token NLL and optional entropy, dispatched by input device.
++
++    Supplying int64 ``selected_token_ids[K]`` appends FP32 full-vocabulary
++    log-probabilities ``[M,K]`` to the outputs. Ignored rows are zero; ID order
++    and duplicates are preserved. All floating-point outputs are differentiable.
++    """
+ 
+     @staticmethod
+     def apply(
+@@ -339,6 +390,7 @@ class LigerFusedLinearScaledCrossEntropyFunction:
+         ignore_index=-100,
+         m_tiles_per_cluster=1,
+         return_entropy=False,
++        selected_token_ids=None,
+     ):
+         if not isinstance(m_tiles_per_cluster, int) or isinstance(m_tiles_per_cluster, bool):
+             raise TypeError("m_tiles_per_cluster must be an int")
+@@ -347,7 +399,16 @@ class LigerFusedLinearScaledCrossEntropyFunction:
+         if not isinstance(return_entropy, bool):
+             raise TypeError("return_entropy must be a bool")
+ 
+-        implementation = _resolve_implementation(_input.device)
++        # Full ranges must not enter the SM90 compile-time K loop: K=V makes
++        # that specialization grow quadratically. Reuse Liger's portable
++        # autograd implementation, which still materializes every logprob.
++        selected_token_ids = _validate_selected_token_ids(selected_token_ids, weight)
++        full_range = selected_token_ids is not None and selected_token_ids.numel() == weight.shape[0] and torch.equal(
++            selected_token_ids, torch.arange(weight.shape[0], device=weight.device)
++        )
++        portable = full_range or _input.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16
++        implementation = _FusedLinearPPOFallbackFunction if portable else _resolve_implementation(_input.device)
++        selected_args = (selected_token_ids,)
+         if implementation is _FusedLinearPPOFallbackFunction:
+             return implementation.apply(
+                 _input,
+@@ -356,6 +417,7 @@ class LigerFusedLinearScaledCrossEntropyFunction:
+                 temperature,
+                 ignore_index,
+                 return_entropy,
++                *selected_args,
+             )
+         return implementation.apply(
+             _input,
+@@ -365,6 +427,7 @@ class LigerFusedLinearScaledCrossEntropyFunction:
+             ignore_index,
+             m_tiles_per_cluster,
+             return_entropy,
++            *selected_args,
+         )
+ 
+ 

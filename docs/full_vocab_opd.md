@@ -1,10 +1,8 @@
 # Full-Vocabulary Coverage-Adaptive Agentic OPD
 
-当前实现基于 veRL `3fdf2b548882a8aeccf0842c2150d9c9f1790a55`，使用原生异步
-**vLLM Teacher + FSDP2 Student**。Student Full-Vocab 算子、Coverage、RKL、REC、
-stop-gradient 和 optimizer cadence 延续上一版。本轮按 README 修正带 `alpha_max` 的
-mixing schedule 与 Full-RKL 边界，并将 Teacher H2D 限定为 CPU 选出的 action rows。
-逐文件变更及测试证据见 [交付报告](full_vocab_opd_delivery_report.md)。
+本实现基于 veRL，使用原生异步 **vLLM Teacher + FSDP2 Student**。
+Teacher 提供完整词表分布，Student 使用可微 Full-Vocab 算子计算 Coverage / RKL / REC，
+并通过原生 backward、gradient accumulation 和 optimizer 完成训练。
 
 ## 数据流
 
@@ -67,7 +65,7 @@ vLLM 0.32.0 的 [SamplingParams](https://github.com/vllm-project/vllm/blob/v0.32
 不完整 collection、vocab 越界或 request 错配均明确报错。服务端从实际 model config
 读取 V，不从 tokenizer 长度推测。
 
-Prompt scores 不受 sampling temperature 影响。为保留上一版 temperature objective，
+Prompt scores 不受 sampling temperature 影响。为使用配置的分布温度，
 Manager 在 CPU 计算 `log_softmax(raw_prompt_logprobs / full_vocab_opd.temperature)`，
 随后转为配置的缓存 dtype。最后一行是无 next prompt token 的零占位行。
 
@@ -95,8 +93,7 @@ synthetic sample 安全返回 `[0,V]`。不搬运完整 Teacher microbatch `[B_m
 
 CPU payload 大约为 `B*T*V*sizeof(cache_dtype)`；服务端与传输还会有临时副本。
 Student Full-Vocab 输出大约为 `4*N_mu*V` GPU bytes；Teacher H2D 仅为
-`4*N_action_mu*V` FP32 bytes，loss/sort 另有临时开销。这是 tensor 大小估算，
-不是实测 GPU peak memory。
+`4*N_action_mu*V` FP32 bytes，loss/sort 另有临时开销。
 本版接受 dense RAM 存储，不引入额外内存预算、memmap、磁盘缓存或请求 batcher。
 `teacher_cache.dtype` 仅控制 CPU payload 精度，支持 float16/bfloat16/float32。
 FP16 非有限值会报错，可改用更宽 dtype。原生 TQ 清理、checkpoint 行为保持原样。
@@ -190,7 +187,7 @@ Teacher 没有 FSDP microbatch 参数。
 在符合 veRL Main 依赖的 GPU 环境安装与启动：
 
 ```bash
-cd /root/autodl-tmp/HyOPD-full-vocab-publish
+cd /path/to/HyOPD
 uv sync --extra fsdp --extra vllm
 source .venv/bin/activate
 bash patches/liger/install.sh
@@ -198,8 +195,7 @@ bash patches/liger/install.sh
 bash examples/on_policy_distillation_trainer/run_full_vocab_adaptive_opd.sh
 ```
 
-本次 `.venv` 用于 CPU 验证，生产 GPU 环境需安装对应 CUDA 依赖。执行 `uv sync` 后应
-重新运行 Liger installer，以免恢复为未打 patch 的 upstream wheel。
+执行 `uv sync` 后应重新运行 Liger installer，以免恢复为未打 patch 的 upstream wheel。
 配置可先用 launcher 的 `--cfg job --resolve` 检查。首次 GPU 单步可加：
 
 ```bash
@@ -207,11 +203,3 @@ bash examples/on_policy_distillation_trainer/run_full_vocab_adaptive_opd.sh \
   trainer.total_training_steps=1 trainer.total_epochs=1 \
   trainer.val_before_train=false trainer.test_freq=-1 trainer.save_freq=-1
 ```
-
-回归命令、结果与 GPU 验证边界见 [交付报告](full_vocab_opd_delivery_report.md)。
-
-当前无卡 2GB 环境仅运行指定六个文件的 CPU correctness regression：
-**42 passed、0 failed**，总 cgroup 内存峰值 **1665.8 MiB**，无 OOM。
-未执行真实 CUDA/vLLM Teacher、FSDP2 collective/NCCL、GPU peak memory/throughput
-或 Ray E2E；GPU smoke 保留 opt-in 且本轮未运行。未安装或改变任何依赖。
-不要在当前 2GB 无卡环境执行上面的 GPU 安装或训练命令。

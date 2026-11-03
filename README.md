@@ -22,15 +22,8 @@ Teacher 分布保存在 CPU；当前 micro-batch 在 Student forward 后先在 C
 action prediction rows，仅将 `[N_action,V]` 以 FP32 搬入 GPU。
 
 - [配置、安装与训练指南](docs/full_vocab_opd.md)
-- [逐文件变更及交付报告](docs/full_vocab_opd_delivery_report.md)
-- [测试记录与验证边界](docs/full_vocab_opd_validation.txt)
 - [完整 YAML 示例](examples/on_policy_distillation_trainer/full_vocab_adaptive_opd.yaml)
 - [veRL 上游 README](README.verl.md)
-
-本轮精简 CPU correctness 回归 **42 passed、0 failed**，总 cgroup 内存峰值
-**1665.8 MiB**，低于当前 AutoDL 无卡模式的 2GB 限制。没有启动真实 CUDA/vLLM Teacher、
-FSDP2 collective/NCCL 或 Ray 集群；GPU peak memory / throughput 未验证。
-GPU smoke 保留为 opt-in，本轮未运行；完整范围见交付报告。
 
 在已安装匹配 GPU 依赖、应用 Liger patch 并配置指南中的 `OPD_*` 变量后运行：
 
